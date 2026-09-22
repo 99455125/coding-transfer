@@ -1,0 +1,24 @@
+<idea-plugin>
+    <id>com.shie.tools.git-change-export</id>
+    <name>Every Sync</name>
+    <version>4.2.3</version>
+    <vendor>Coding Transfer</vendor>
+    <description><![CDATA[
+    Project-scoped clipboard synchronization. VM is the business source of truth.
+    One plugin, HOST/VM roles configured in Settings. Full/incremental Git bundles and
+    authoritative HOST apply after explicit confirmation; receipt-based baselines.
+    VM Git and outer workspace Git are never automatically committed or pushed.
+    Separate Project Transfer and File Transfer tabs; binary single-file chunks with
+    filename, SHA-256 verification and receiver-selected save location.
+    ]]></description>
+    <idea-version since-build="251.26094.121" until-build="253.*"/>
+    <depends>com.intellij.modules.platform</depends>
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Every Sync" anchor="right" factoryClass="dev.codingtransfer.plugin.SyncToolWindow" icon="AllIcons.Actions.Synchronize"/>
+    </extensions>
+    <actions>
+        <action id="CodingTransfer.OpenSync" class="dev.codingtransfer.plugin.OpenSyncAction" text="Every Sync — 代码同步" description="打开项目级剪贴板同步窗口">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

@@ -1,0 +1,17 @@
+role: VM
+git: 'C:/Program Files/Git/cmd/git.exe'
+projects:
+  - id: ri-core
+    local: shie-ri-core
+    vm: D:/ideaprojects/ri-core
+  - id: pangu
+    local: /Users/dasensen/IdeaProjects/pangu
+    vm: D:/ideaprojects/pangu
+exclude:
+  - .idea/**
+  - target/**
+  - build/**
+  - node_modules/**
+  - '*.log'
+clipboard:
+  chunk-size-kb: 128
