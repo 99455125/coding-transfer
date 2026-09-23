@@ -1,5 +1,53 @@
 # Validation — Coding Transfer
 
+## 2026-09-22 — Every Sync 4.3.4 confirmation button alignment
+
+- Confirmation buttons now share one preferred-width, equal-width grid with an 8-scaled-pixel gap, anchored at the right of a separate full-width bar. Cancel is immediately left of Confirm; text and actions unchanged.
+- Release compilation/packaging completed against IC-251.26094.121. No tests or live IDEA UI validation performed; visual acceptance remains with the user.
+- Artifact: `dist/every-sync-4.3.4.zip` and adjacent build-generated SHA-256 file.
+
+## 2026-09-22 — Every Sync 4.3.3 UI delivery
+
+- Release compilation/packaging against IC-251.26094.121 completed. No automated tests, full regression or live IDEA UI checks were run.
+- Project send/receive counts use payload.entries().size(), including deletes, independent of per-ref display rows. Receipt handling does not use these file counts. Preview and successful apply display separate actual change counts; reset/clear/new generation clear the relevant summaries.
+- Both copying panels retain a single copied/missing-block progress display. Project file counts are separate from transient operation messages.
+- TransferConfirmDialog replaces the large checkbox-based apply dialog and VM generation confirmation. Apply keeps original target/source HEAD/source-branch wording and role visibility; buttons explicitly place Cancel left and Confirm right. Text width is capped; no fixed tall preferred panel or stored dialog-size key.
+- MergeDialogs, ThreeWayMerge, Git merging, payload format, backup, stale checks and rollback were not changed. No automatic application or Git writes added.
+- Artifact: `dist/every-sync-4.3.3.zip`; use the adjacent build-generated `.sha256` file for checksum. Window sizing/button interaction on Windows and HOST still require manual acceptance.
+
+## 2026-09-22 — Every Sync 4.3.2 maintenance delivery
+
+- Release `./build.sh` compiled and packaged against IC-251.26094.121. Core and test sources also compiled with Java 21, without executing tests.
+- **No test group, full regression, GUI check or performance benchmark was run**, per the approved verification policy. Prior release results below do not certify 4.3.2.
+- One read-only code review found no blocking issue in extraction, chunk integrity or explicit test-group routing. Static review is not proof of runtime equivalence.
+- Extracted ProjectTransferService, GitCommandRunner, GitImportTransaction, ProjectChunkCodec and ProjectInbox; SyncEngine's generation roles now have separate methods. File apply/rollback order and protocol formats retained.
+- Incomplete project receive no longer reads/concatenates prior block contents. Completion still validates all persisted blocks and the full payload. Added an unexecuted corruption/resume regression for this boundary.
+- Removed two duplicate WorktreeTest cases, retaining actual empty-file application and stronger staged-delete/recreation checks in UntrackedTest. Shared fixture/Git/assertion helpers; explicit core/worktree/bundle/transport/cache/large/all entrypoints; SendCacheTest included; large-file checks isolated; success summaries and failure logs handled by TestRunner.
+- AGENTS.md and MAINTENANCE.md require explicit full-suite approval and focused reading. No real Git writes, installation, external sending or dependency additions.
+- Artifact: `dist/every-sync-4.3.2.zip`; build-generated SHA-256 `977bb5dcc31ed3dba3ab86cb18819e64592f3963a3c81200058cbc9c2a823d43`.
+- Deferred as agreed: disk-backed project sending, streaming project payload codec and full-snapshot memory redesign. No claimed measured speedup or heap reduction.
+
+## 2026-09-22 — Every Sync 4.3.1 untracked HOST files
+
+- Fresh `./build.sh test`: **288 checks passed** (134 core, 37 Bundle, 47 file, 24 refs, 36 WORKTREE, 10 untracked).
+- New regression first failed against tracked-only generation, then passed with nonignored untracked text/binary/empty files, null BASE encoding, unchanged HOST HEAD/index and VM index, duplicate receive, Add/Add conflict, and staged-delete/recreated-path deduplication. Prior tracked-only expectations were updated to the approved inclusion rule.
+- Read-only review found leading whitespace loss in NUL-delimited filenames. A new test reproduced failure before the fix; raw stdout parsing now preserves filenames and the full suite passes.
+- `./build.sh` compiled and packaged against IC-251.26094.121; ZIP integrity and SHA-256 sidecar verified.
+- Artifact: `dist/every-sync-4.3.1.zip`; SHA-256 `4369505bd37fff1a02c63db4580715f08e9be21b09359cb9b3e7cdc8778d63de`.
+- V3 protocol, VM Bundle/ACK, existing merge behavior and real repository Git state unchanged. Git writes occurred only in disposable test fixtures. Native IDEA GUI and Windows VM runtime not exercised; no automatic installation.
+
+## 2026-09-22 — Every Sync 4.3.0 HOST Change Set / VM merge
+
+- Fresh `./build.sh test`: **278 checks passed** (134 core, 37 Bundle, 47 file, 24 refs, 36 WORKTREE).
+- New WORKTREE tests first reproduced the old NO_BASELINE requirement, then covered tracked-only generation, source HEAD/branch, raw BASE codec and tamper rejection, V3 clipboard, staged add + unstaged edits, branch switching, ordinary untracked/ignored/exclude omission, staged deletion followed by recreation, CRLF warnings separated from Git output.
+- VM tests cover different HEAD automatic merge, VM HEAD/index preservation, idempotent receive, overlapping conflict, unresolved apply rejection, cancellation/no pre-apply writes, explicit resolutions, stale worktree rejection, Add/Add, Modify/Delete, Deleted/Modified, binary conflicts, empty-file distinction, multiple merge-file conflicts, HEAD-only changes after preview, legacy WORKTREE rejection and transaction rollback.
+- Regression fixtures now use independent inner Git and full Bundle initialization where HOST tracked generation is exercised. Older expectations for baseline-generated untracked proposals and strict HEAD rejection were changed to the approved 4.3 behavior, not simply removed. VM→HOST authoritative replacement/refs/ACK and independent file tests remain passing.
+- Read-only reviewer checked core and native merge adapter. Fixed the reported BOM/CR text serialization issue; added BOM, CRLF, CR and mixed-ending tests. Mixed endings require explicit confirmation before normalizing a manually edited merge output. LEFT/RIGHT use exact original bytes.
+- `./build.sh` passed against IC-251.26094.121. Separate source/API compilation against installed IDEA 253 passed. ZIP integrity and SHA-256 sidecar passed.
+- Artifact: `dist/every-sync-4.3.0.zip`; SHA-256 `f7e781a3c6e61d2a7bcddc5b3cc3b09b271bba23e672c8005342b285f9b27162`.
+- No real business Git write operations, no automatic installation or external sending. Git commits/branch operations occurred only in disposable test repositories with explicit user approval.
+- **Not runtime-verified:** native IDEA merge window interaction (text/binary, close/cancel, delete-vs-empty choice), Windows VM execution and Windows App clipboard. SDK compilation and core tests are not a substitute for these GUI checks. Both ends must upgrade; regenerate old HOST WORKTREE packets.
+
 ## 2026-09-21 — Sender clear-session buttons
 
 - Project and file send pages now clear generated blocks/copy indexes and explicitly tracked temporary outgoing cache files. Baselines, pending ACK state, backups, source and receiver files remain untouched.

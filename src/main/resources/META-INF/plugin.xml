@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.shie.tools.git-change-export</id>
     <name>Every Sync</name>
-    <version>4.2.3</version>
+    <version>4.3.4</version>
     <vendor>Coding Transfer</vendor>
     <description><![CDATA[
     Project-scoped clipboard synchronization. VM is the business source of truth.

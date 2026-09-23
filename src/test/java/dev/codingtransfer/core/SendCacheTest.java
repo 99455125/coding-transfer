@@ -6,7 +6,10 @@ import java.util.UUID;
 /** Isolated sender cleanup checks; never touches user repositories. */
 public final class SendCacheTest {
     public static void main(String[] args)throws Exception {
-        Path workspace=Files.createTempDirectory("send-cache-test-").toRealPath();
+        TestRunner.main(new String[]{"cache"});
+    }
+    static void run(Path temp)throws Exception {
+        Path workspace=Files.createDirectories(temp.resolve("send-cache"));
         Path source=workspace.resolve("source.bin");Files.writeString(source,"source");
         FileTransfer.Outgoing outgoing=FileTransfer.generate(source,4,workspace);
         Path pending=SafeFiles.state(workspace).resolve("bundle-state/pending/project.gz");
@@ -28,5 +31,5 @@ public final class SendCacheTest {
         try{SafeFiles.clearOutgoing(workspace,"git-outgoing","../baselines");throw new AssertionError("traversal accepted");}catch(java.io.IOException expected){}
         System.out.println("PASS sender cache cleanup checks");
     }
-    private static void check(boolean value,String message){if(!value)throw new AssertionError(message);}
+    private static void check(boolean value,String message){TestSupport.check(value,message);}
 }

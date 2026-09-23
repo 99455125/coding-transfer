@@ -8,7 +8,7 @@ import static dev.codingtransfer.core.Model.*;
 final class FileTransferTest {
     private static int checks;
     private interface Checked{void run()throws Exception;}
-    private static void check(boolean ok,String name){if(!ok)throw new AssertionError(name);checks++;System.out.println("PASS FILE "+name);}
+    private static void check(boolean ok,String name){TestSupport.check(ok,name);checks++;System.out.println("PASS FILE "+name);}
     private static void fails(String name,Checked action)throws Exception{try{action.run();}catch(IOException e){check(true,name);return;}throw new AssertionError("Expected failure: "+name);}
     static void run(Path temp)throws Exception{
         Path sender=Files.createDirectory(temp.resolve("file-sender")),receiver=Files.createDirectory(temp.resolve("file-receiver"));
@@ -52,6 +52,12 @@ final class FileTransferTest {
         Path empty=sender.resolve("empty.bin");Files.write(empty,new byte[0]);FileTransfer.Outgoing zero=FileTransfer.generate(empty,4);check(zero.chunks().size()==1,"empty file has one block");
         FileTransfer.Received emptyResult=FileTransfer.receive(receiver,zero.chunks().getFirst());FileTransfer.save(emptyResult,FileTransfer.destination(receiver.resolve("empty-output")));check(Files.size(receiver.resolve("empty-output"))==0,"empty file saved exactly");
         fails("directory source rejected",()->FileTransfer.generate(sender,4));fails("chunk lower limit",()->FileTransfer.generate(file,1));fails("chunk upper limit",()->FileTransfer.generate(file,4097));
+        check(Files.readString(receiver.resolve(".vmsync/.gitignore")).contains("file-inbox/"),"file inbox ignored by outer Git");
+        check(!Files.exists(receiver.resolve(".vmsync/config.yaml")),"no role or project configuration required");
+        System.out.println("PASS ALL "+checks+" File checks");
+    }
+    static void runLarge(Path temp)throws Exception{
+        Path sender=Files.createDirectory(temp.resolve("large-sender")),receiver=Files.createDirectory(temp.resolve("large-receiver"));
         Path big=sender.resolve("oversize.bin");try(RandomAccessFile out=new RandomAccessFile(big.toFile(),"rw")){out.setLength(65L*1024*1024+1);}
         FileTransfer.Outgoing large=FileTransfer.generate(big,4096);check(large.metadata().size()==65L*1024*1024+1,"former 64 MiB cap removed, disk-backed 4096 KiB chunks");
         FileTransfer.Received largeResult=FileTransfer.receive(receiver,large.chunks().get(2));check(largeResult.firstMissing()==1,"middle-first file chunk points to block 1");
@@ -60,8 +66,6 @@ final class FileTransferTest {
         for(String block:large.chunks())largeResult=FileTransfer.receive(receiver,block);
         check(largeResult.complete()&&largeResult.firstMissing()==0,"large file all chunks completed");
         Path bigTarget=receiver.resolve("large-output.bin");FileTransfer.save(largeResult,FileTransfer.destination(bigTarget));check(Files.size(bigTarget)==large.metadata().size(),"large file streamed to chosen target");
-        check(Files.readString(receiver.resolve(".vmsync/.gitignore")).contains("file-inbox/"),"file inbox ignored by outer Git");
-        check(!Files.exists(receiver.resolve(".vmsync/config.yaml")),"no role or project configuration required");
-        System.out.println("PASS ALL "+checks+" File checks");
+        System.out.println("PASS ALL large file checks");
     }
 }

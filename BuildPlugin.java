@@ -10,9 +10,13 @@ import javax.tools.ToolProvider;
 public final class BuildPlugin {
     public static void main(String[] args) throws Exception {
         if (Runtime.version().feature() != 21) throw new IllegalStateException("Plugin build requires JDK 21");
-        if (args.length != 2) throw new IllegalArgumentException("Usage: java BuildPlugin.java test|build IDEA_SDK");
+        if (args.length < 2 || args.length > 3) throw new IllegalArgumentException("Usage: java BuildPlugin.java test|build IDEA_SDK [test-group]");
         boolean test = args[0].equals("test");
         if (!test && !args[0].equals("build")) throw new IllegalArgumentException("Unknown task");
+        if (test && (args.length != 3 || !Set.of("core","worktree","bundle","transport","cache","large","all").contains(args[2]))) {
+            throw new IllegalArgumentException("Specify test group: core|worktree|bundle|transport|cache|large|all");
+        }
+        if (!test && args.length != 2) throw new IllegalArgumentException("Build does not accept a test group");
         Path root=Path.of("").toAbsolutePath(), sdk=Path.of(args[1]);
         Files.createDirectories(root.resolve(".build"));
         Path output=Files.createTempDirectory(root.resolve(".build"),test?"test-":"release-");
@@ -27,7 +31,7 @@ public final class BuildPlugin {
         if(test)try(var paths=Files.walk(root.resolve("src/test/java"))){options.addAll(paths.filter(p->p.toString().endsWith(".java")).map(Path::toString).toList());}
         if(ToolProvider.getSystemJavaCompiler().run(null,null,null,options.toArray(String[]::new))!=0)throw new IOException("Compilation failed");
         if(test){
-            int code=new ProcessBuilder(Path.of(System.getProperty("java.home"),"bin","java").toString(),"-Dstdout.encoding=UTF-8","-Dstderr.encoding=UTF-8","-ea","-cp",classes.toString(),"dev.codingtransfer.core.CoreTest").inheritIO().start().waitFor();
+            int code=new ProcessBuilder(Path.of(System.getProperty("java.home"),"bin","java").toString(),"-Dstdout.encoding=UTF-8","-Dstderr.encoding=UTF-8","-Deverysync.test.logs="+output,"-ea","-cp",classes.toString(),"dev.codingtransfer.core.TestRunner",args[2]).inheritIO().start().waitFor();
             if(code!=0)throw new IOException("Tests failed");return;
         }
         Path resources=root.resolve("src/main/resources");
@@ -38,7 +42,7 @@ public final class BuildPlugin {
                 JarEntry entry=new JarEntry(classes.relativize(file).toString().replace('\\','/'));entry.setTime(0);out.putNextEntry(entry);Files.copy(file,out);out.closeEntry();
             }
         }
-        Path zip=output.resolve("every-sync-4.2.3.zip");
+        Path zip=output.resolve("every-sync-4.3.4.zip");
         try(ZipOutputStream out=new ZipOutputStream(Files.newOutputStream(zip))){ZipEntry entry=new ZipEntry("coding-transfer/lib/coding-transfer.jar");entry.setTime(0);out.putNextEntry(entry);Files.copy(jar,out);out.closeEntry();}
         Path dist=Files.createDirectories(root.resolve("dist")).resolve(zip.getFileName());Files.copy(zip,dist,StandardCopyOption.REPLACE_EXISTING);
         String sha=HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(dist)));

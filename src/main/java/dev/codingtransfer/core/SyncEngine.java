@@ -17,11 +17,12 @@ public final class SyncEngine {
         public final Payload payload;
         public final Path root;
         public final List<Change> changes;
+        public final List<ThreeWayMerge.Conflict> conflicts;
         private final SortedMap<String,byte[]> before,after;
         private Payload target;
-        private GitHistory.Plan gitPlan;
-        private Preview(Payload payload,Path root,List<Change> changes,SortedMap<String,byte[]> before,SortedMap<String,byte[]> after){
-            this.payload=payload;this.root=root;this.changes=List.copyOf(changes);this.before=before;this.after=after;
+        private GitImportTransaction.Plan gitPlan;
+        private Preview(Payload payload,Path root,List<Change> changes,SortedMap<String,byte[]> before,SortedMap<String,byte[]> after,List<ThreeWayMerge.Conflict> conflicts){
+            this.payload=payload;this.root=root;this.changes=List.copyOf(changes);this.before=before;this.after=after;this.conflicts=List.copyOf(conflicts);
         }
     }
     private Path baseline(String id)throws IOException{projectId(id);Path p=SafeFiles.state(workspace).resolve("baselines").resolve(id+".gz");SafeFiles.noLinks(p);return p;}
@@ -45,23 +46,30 @@ public final class SyncEngine {
     }
     public Generated generate(String id)throws IOException{
         Config.Mapping mapping=config.project(id);Path root=config.root(workspace,mapping);
-        if(config.role()==Role.VM){
-            String head=GitReader.head(root,config.git());SortedMap<String,byte[]> current=SafeFiles.scan(root,config);
-            SafeFiles.same(current,SafeFiles.scan(root,config));require(head.equals(GitReader.head(root,config.git())),"VM HEAD 在扫描期间改变，请重试");
-            return new Generated(snapshot(id,head,current),diff(new TreeMap<>(),current),root);
-        }
-        Payload base=readBaseline(id);SortedMap<String,byte[]> before=manifest(base),current=SafeFiles.scan(root,config);
-        SafeFiles.same(current,SafeFiles.scan(root,config));List<Change> changes=diff(before,current);List<Entry> entries=new ArrayList<>();
+        return config.role()==Role.VM ? generateSnapshot(id,root) : generateWorktree(id,root);
+    }
+
+    private Generated generateSnapshot(String id,Path root)throws IOException{
+        String head=GitReader.head(root,config.git());
+        SortedMap<String,byte[]> current=SafeFiles.scan(root,config);
+        SafeFiles.same(current,SafeFiles.scan(root,config));
+        require(head.equals(GitReader.head(root,config.git())),"VM HEAD 在扫描期间改变，请重试");
+        return new Generated(snapshot(id,head,current),diff(new TreeMap<>(),current),root);
+    }
+
+    private Generated generateWorktree(String id,Path root)throws IOException{
+        GitHistory.Tips tips=GitHistory.tips(root,config.git());
+        List<GitHistory.RefChange> rows=GitHistory.hostChanges(root,config.git(),tips,config);
+        List<Change> changes=new ArrayList<>();List<Entry> entries=new ArrayList<>();
+        for(GitHistory.RefChange row:rows){Change c=GitHistory.loadTrackedChange(root,config.git(),row);if(!Arrays.equals(c.before(),c.after()))changes.add(c);}
         for(Change c:changes){
-            byte[] a=c.before(),b=c.after();Encoding encoding;byte[] data;
-            if(b==null){encoding=Encoding.DELETE;data=new byte[0];}
-            else if(a!=null && TextPatch.text(a)!=null && TextPatch.text(b)!=null){
-                encoding=Encoding.PATCH;data=TextPatch.create(a,b);
-            }
-            else{encoding=Encoding.RAW;data=b;}
-            entries.add(new Entry(c.path(),hash(a),hash(b),encoding,data));
+            byte[] a=c.before(),b=c.after();entries.add(new Entry(c.path(),hash(a),hash(b),b==null?Encoding.DELETE:Encoding.RAW,b==null?new byte[0]:b,a));
         }
-        Payload payload=new Payload(Type.WORKTREE,id,base.head(),config.policy(),entries);Codec.validate(payload);
+        require(rows.equals(GitHistory.hostChanges(root,config.git(),tips,config)),"HOST 变更集合在生成期间改变，请重试");
+        for(GitHistory.RefChange row:rows){Change again=GitHistory.loadTrackedChange(root,config.git(),row);Entry e=entries.stream().filter(v->v.path().equals(row.path())).findFirst().orElse(null);
+            require(e==null?Arrays.equals(again.before(),again.after()):e.before().equals(hash(again.before()))&&e.after().equals(hash(again.after())),"HOST 文件在生成期间改变，请重试: "+row.path());}
+        GitHistory.Tips end=GitHistory.tips(root,config.git());require(tips.head().equals(end.head())&&tips.branch().equals(end.branch()),"HOST HEAD/分支在生成期间改变，请重试");
+        Payload payload=Payload.worktree(id,tips.head(),config.policy(),tips.branch(),entries);Codec.validate(payload);
         return new Generated(payload,changes,root);
     }
     public Preview preview(String selectedId,Payload payload)throws IOException{
@@ -72,27 +80,40 @@ public final class SyncEngine {
         Payload target=payload;
         if(config.role()==Role.HOST&&payload.git()!=null)target=new BundleSync(workspace,config).target(payload);
         Path root=config.root(workspace,config.project(selectedId));checkHead(root,payload);
+        List<ThreeWayMerge.Conflict> conflicts=new ArrayList<>();
         SortedMap<String,byte[]> before=SafeFiles.scan(root,config),after;
         if(config.role()==Role.HOST)after=manifest(target);
         else{
             after=new TreeMap<>(before);
             for(Entry e:payload.entries()){
                 require(!config.excluded(e.path()),"包中存在排除文件: "+e.path());SafeFiles.resolve(root,e.path());
-                byte[] old=before.get(e.path());require(hash(old).equals(e.before()),"BASE_CONTENT_MISMATCH: VM 文件已有不同修改: "+e.path());
-                byte[] next=switch(e.encoding()){case DELETE->null;case RAW->e.data();case PATCH->TextPatch.apply(old,e.data());};
-                require(hash(next).equals(e.after()),"CHECKSUM_ERROR: 应用结果不匹配: "+e.path());
+                byte[] old=before.get(e.path()),theirs=e.encoding()==Encoding.DELETE?null:e.data();
+                ThreeWayMerge.Result merged=ThreeWayMerge.merge(root,config.git(),e.base(),old,theirs);
+                if(merged.conflict()){conflicts.add(new ThreeWayMerge.Conflict(e.path(),e.base(),old,theirs));continue;}
+                byte[] next=merged.content();
                 if(next==null)after.remove(e.path());else after.put(e.path(),next);
             }
         }
         require(after.size()<=FILE_COUNT,"目标项目文件数量超过限制");
         SafeFiles.validateNames(after.keySet());
         List<Change> changes=diff(before,after);preflight(root,changes);checkHead(root,payload);
-        Preview preview=new Preview(payload,root,changes,before,after);preview.target=target;
-        if(payload.git()!=null)preview.gitPlan=GitHistory.prepare(workspace,root,config.git(),payload);
+        Preview preview=new Preview(payload,root,changes,before,after,conflicts);preview.target=target;
+        if(payload.git()!=null)preview.gitPlan=GitImportTransaction.prepare(workspace,root,config.git(),payload);
         return preview;
     }
     private void checkHead(Path root,Payload p)throws IOException{
-        if(config.role()==Role.VM)require(GitReader.head(root,config.git()).equals(p.head()),"BASE_MISMATCH: 当前 VM HEAD 不等于 HOST 基线；请先发送新的 VM 快照");
+        if(config.role()==Role.VM){require(p.version()==3,"请升级两端插件并重新生成 HOST 传输；旧 WORKTREE 不支持三方合并");GitReader.head(root,config.git());}
+    }
+    public Preview resolve(Preview original,Map<String,byte[]> resolutions)throws IOException{
+        require(original.payload.type()==Type.WORKTREE&&config.role()==Role.VM,"仅 WORKTREE 支持冲突解决");
+        Set<String> expected=new HashSet<>();for(var c:original.conflicts)expected.add(c.path());
+        require(resolutions.keySet().equals(expected),"必须解决全部冲突后才能应用");
+        SafeFiles.same(original.before,SafeFiles.scan(original.root,config));
+        SortedMap<String,byte[]> after=new TreeMap<>(original.after);
+        for(var e:resolutions.entrySet()){if(e.getValue()==null)after.remove(e.getKey());else after.put(e.getKey(),e.getValue().clone());}
+        require(after.size()<=FILE_COUNT,"目标项目文件数量超过限制");SafeFiles.validateNames(after.keySet());
+        List<Change> changes=diff(original.before,after);preflight(original.root,changes);
+        Preview result=new Preview(original.payload,original.root,changes,original.before,after,List.of());result.target=original.target;return result;
     }
     private void preflight(Path root,List<Change> changes)throws IOException{
         Set<String> folded=new HashSet<>();
@@ -107,6 +128,7 @@ public final class SyncEngine {
     public Path apply(Preview preview)throws IOException { return apply(preview, completed -> {}); }
     // Package-private observer allows deterministic failure/recovery tests, never populated from payloads.
     Path apply(Preview preview,ApplyObserver observer)throws IOException{
+        require(preview.conflicts.isEmpty(),"存在未解决冲突，不能应用");
         require(config.root(workspace,config.project(preview.payload.project())).equals(preview.root),"项目路径已改变");
         SafeFiles.noLinks(preview.root);Files.createDirectories(preview.root);SafeFiles.noLinks(preview.root);
         // One lock per actual target, even when different IDEA workspaces/IDs map to it.
@@ -133,10 +155,10 @@ public final class SyncEngine {
         SafeFiles.atomicWrite(backup.resolve("status.txt"),"PREPARED".getBytes(StandardCharsets.UTF_8));
         // Backup is complete before the first business-file mutation.
         SafeFiles.same(preview.before,SafeFiles.scan(preview.root,config));checkHead(preview.root,preview.payload);
-        List<Change> done=new ArrayList<>();GitHistory.Transaction git=null;
+        List<Change> done=new ArrayList<>();GitImportTransaction.Transaction git=null;
         try{
             if(preview.payload.type()==Type.DELTA)new BundleSync(workspace,config).target(preview.payload);
-            if(preview.gitPlan!=null)git=GitHistory.begin(preview.gitPlan,config.git(),backup);
+            if(preview.gitPlan!=null)git=GitImportTransaction.begin(preview.gitPlan,config.git(),backup);
             for(Change c:preview.changes){
                 Path target=SafeFiles.resolve(preview.root,c.path());
                 byte[] now=Files.exists(target,LinkOption.NOFOLLOW_LINKS)?SafeFiles.read(target):null;

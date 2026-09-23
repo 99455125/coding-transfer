@@ -9,4 +9,10 @@ else
   plugin_jdk="$(/usr/libexec/java_home -v 21)"
 fi
 plugin_sdk="${PLUGIN_SDK:-$HOME/Library/Caches/coding-transfer-sdk-2025.1.2}"
-"$plugin_jdk/bin/java" -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 BuildPlugin.java "${1:-build}" "$plugin_sdk"
+if [[ $# -gt 2 ]]; then
+  echo "Usage: ./build.sh [build | test GROUP]" >&2
+  exit 2
+fi
+build_args=("${1:-build}" "$plugin_sdk")
+if [[ $# -eq 2 ]]; then build_args+=("$2"); fi
+"$plugin_jdk/bin/java" -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 BuildPlugin.java "${build_args[@]}"

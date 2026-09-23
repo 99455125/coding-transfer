@@ -10,18 +10,28 @@ public final class Model {
     public enum Role { HOST, VM }
     public enum Type { WORKTREE, SNAPSHOT, DELTA, ACK }
     public enum Encoding { RAW, PATCH, DELETE }
-    public record Entry(String path, String before, String after, Encoding encoding, byte[] data) {
-        public Entry { data = data.clone(); }
+    public record Entry(String path, String before, String after, Encoding encoding, byte[] data, byte[] base) {
+        public Entry {
+            data = data.clone();
+            base = base == null ? null : base.clone();
+        }
+        public Entry(String path,String before,String after,Encoding encoding,byte[] data){this(path,before,after,encoding,data,null);}
         @Override public byte[] data() { return data.clone(); }
+        @Override public byte[] base() { return base == null ? null : base.clone(); }
     }
     public record GitData(String snapshot, String parent, String branch, SortedMap<String,String> refs, byte[] bundle) {
         public GitData { refs=Collections.unmodifiableSortedMap(new TreeMap<>(refs));bundle=bundle.clone(); }
         @Override public byte[] bundle(){return bundle.clone();}
         public GitData withoutBundle(){return new GitData(snapshot,parent,branch,refs,new byte[0]);}
     }
-    public record Payload(Type type, String project, String head, String policy, List<Entry> entries, GitData git) {
-        public Payload { entries = List.copyOf(entries); }
-        public Payload(Type type,String project,String head,String policy,List<Entry> entries){this(type,project,head,policy,entries,null);}
+    public record Payload(Type type, String project, String head, String policy, List<Entry> entries, GitData git, String sourceBranch, int version) {
+        public Payload {
+            entries = List.copyOf(entries);
+            sourceBranch = sourceBranch == null ? "" : sourceBranch;
+        }
+        public Payload(Type type,String project,String head,String policy,List<Entry> entries){this(type,project,head,policy,entries,null,"",1);}
+        public Payload(Type type,String project,String head,String policy,List<Entry> entries,GitData git){this(type,project,head,policy,entries,git,"",git==null?1:2);}
+        public static Payload worktree(String project,String head,String policy,String sourceBranch,List<Entry> entries){return new Payload(Type.WORKTREE,project,head,policy,entries,null,sourceBranch,3);}
     }
     public record Change(String path, byte[] before, byte[] after) {
         public Change { before = before == null ? null : before.clone(); after = after == null ? null : after.clone(); }

@@ -1,4 +1,12 @@
-# VMSYNC/1 + VMSYNC/2 protocol
+# VMSYNC/1 + VMSYNC/2 + VMSYNC/3 protocol
+
+4.3.1 adds nonignored HOST untracked files as existing V3 RAW Add entries (absent BASE, before hash `-`). No wire-format change; the 4.3.0 V3 receiver can process these entries using existing Add/Add conflict handling.
+
+## 4.3 WORKTREE extension
+
+New HOST proposals use VMSYNC/3 and binary version 3, WORKTREE only. After project/head/policy, encode source branch (full refs/heads name or empty detached); each entry encodes path, before/after hashes, encoding, BASE length (-1 for absent) and BASE bytes, then THEIRS length and bytes. RAW or DELETE only. BASE hash must match before; RAW bytes must match after; DELETE has absent after and zero data length. Absence is distinct from an empty file.
+
+The existing BASE header is source HEAD metadata, not a receiver equality constraint. VM uses transmitted BASE, its current OURS, and transmitted THEIRS for content merging. Old WORKTREE packets are rejected at VM preview with an upgrade message. V1 snapshots and V2 SNAPSHOT/DELTA/ACK remain compatible and unchanged. Both endpoints must upgrade for new HOST proposals. BASE + THEIRS increases payload size. Conflict UI and cancellation do not alter framing or write business files; resolved results go through preview and explicit apply.
 
 ## 4.1 independent file transport
 
@@ -27,7 +35,7 @@ Persistent `.vmsync/file-inbox/<UUID>/`: metadata.txt, numbered .part binary blo
 
 Extended payloads use VMSYNC/2 and binary version 2. After file entries: snapshot UUID, parent UUID (`-` for full), VM branch or empty for detached, complete refs map (existing reference-count validation retained), length-prefixed Git Bundle bytes. Version 1 file-only payloads remain readable but cannot seed a Git increment chain.
 
-SNAPSHOT is VM→HOST with HEAD header, full files and full bundle. DELTA is VM→HOST with HEAD, file changes and incremental/empty bundle. ACK is HOST→VM with HEAD, accepted snapshot/parent IDs, but no files/bundle/refs/branch. WORKTREE remains VMSYNC/1 HOST→VM with BASE. Header/body/version/direction must agree; mixed-version chunks are refused.
+SNAPSHOT is VM→HOST with HEAD header, full files and full bundle. DELTA is VM→HOST with HEAD, file changes and incremental/empty bundle. ACK is HOST→VM with HEAD, accepted snapshot/parent IDs, but no files/bundle/refs/branch. Legacy WORKTREE used VMSYNC/1; current senders use VMSYNC/3 as above. Header/body/version/direction must agree; mixed-version chunks are refused.
 
 HOST accepts DELTA only when parent matches its accepted baseline. Before-hashes refer to pristine baseline, never local edited bytes. It reconstructs and persists the entire target manifest. ACK comes only from persisted successful baseline; VM accepts only its exact pending target. Duplicate ACK is idempotent. Generation alone never advances acknowledged state; regeneration supersedes pending target.
 

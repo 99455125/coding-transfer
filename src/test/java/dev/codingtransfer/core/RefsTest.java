@@ -5,17 +5,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 import static dev.codingtransfer.core.Model.*;
+import static dev.codingtransfer.core.TestSupport.git;
 
 final class RefsTest {
     private static int checks;
-    private static void check(boolean value,String label){if(!value)throw new AssertionError(label);checks++;System.out.println("PASS REFS "+label);}
-    private static String git(Path root,String... args)throws Exception{
-        List<String> cmd=new ArrayList<>(List.of("git","-C",root.toString()));cmd.addAll(List.of(args));Process p=new ProcessBuilder(cmd).redirectErrorStream(true).start();String result=new String(p.getInputStream().readAllBytes(),StandardCharsets.UTF_8).strip();if(p.waitFor()!=0)throw new IOException(result);return result;
-    }
+    private static void check(boolean value,String label){TestSupport.check(value,label);checks++;System.out.println("PASS REFS "+label);}
+
     private static boolean row(List<GitHistory.RefChange> rows,String ref,String path,boolean working){return rows.stream().anyMatch(r->r.ref().equals(ref)&&r.path().equals(path)&&r.working()==working);}
     static void run(Path temp)throws Exception{
         Path vm=Files.createDirectory(temp.resolve("refs-vm")),host=Files.createDirectory(temp.resolve("refs-host")),local=host.resolve("project");
-        git(vm,"init","-q","-b","main");git(vm,"config","user.name","Test");git(vm,"config","user.email","test@example.invalid");
+        TestSupport.initRepository(vm);
         Files.writeString(vm.resolve("a.txt"),"base\n");Files.writeString(vm.resolve("stable.txt"),"stable\n");git(vm,"add","a.txt","stable.txt");git(vm,"commit","-qm","base");String first=git(vm,"rev-parse","HEAD");
         git(vm,"branch","feature");git(vm,"update-ref","refs/remotes/origin/feature",first);git(vm,"update-ref","refs/custom/release",first);
         Config vc=new Config(Role.VM,List.of(new Config.Mapping("repo","project",vm.toString())),List.of("target/**"),4096,"git"),hc=new Config(Role.HOST,vc.projects(),vc.exclude(),4096,"git");

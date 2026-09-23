@@ -40,6 +40,7 @@ public final class SyncPanel extends JPanel implements Disposable {
     private final JComboBox<Config.Mapping> projects=new JComboBox<>();
     private final JButton settings=new JButton("设置"),records=new JButton("本地记录");
     private final JBTextArea status=note(""),sendStatus=note(""),receiveStatus=note("");
+    private final JLabel sendFiles=new JLabel(),receiveFiles=new JLabel();
     private final JLabel partLabel=new JLabel("尚未生成"),receiveCount=new JLabel("等待接收");
     private final JTabbedPane tabs=new JTabbedPane();
     private final JButton generate=new JButton("生成传输"),prev=new JButton("上一块"),copy=new JButton("复制"),next=new JButton("下一块");
@@ -57,10 +58,10 @@ public final class SyncPanel extends JPanel implements Disposable {
     public SyncPanel(Project project){
         super(new BorderLayout());this.project=project;setBorder(JBUI.Borders.empty(12));
         JPanel header=vertical();header.add(row(new JLabel("项目"),projects,roleLabel,settings,records));add(header,BorderLayout.NORTH);
-        JPanel send=new JPanel(new BorderLayout()),sendTop=vertical();sendTop.add(row(generate,incremental,acceptReceipt,clearSend));sendTop.add(sendStatus);
+        JPanel send=new JPanel(new BorderLayout()),sendTop=vertical();sendTop.add(row(generate,incremental,acceptReceipt,clearSend));sendTop.add(sendStatus);sendTop.add(sendFiles);
         packet.setLayout(new BoxLayout(packet,BoxLayout.Y_AXIS));packet.add(partLabel);packet.add(row(prev,copy,next));packet.setVisible(false);sendTop.add(packet);
         send.add(sendTop,BorderLayout.NORTH);send.add(new JBScrollPane(sendTable),BorderLayout.CENTER);
-        JPanel recv=new JPanel(new BorderLayout()),recvTop=vertical();recvTop.add(row(paste,apply,receipt,clear));recvTop.add(receiveStatus);recvTop.add(receiveCount);recvTop.add(receiveProgress);
+        JPanel recv=new JPanel(new BorderLayout()),recvTop=vertical();recvTop.add(row(paste,apply,receipt,clear));recvTop.add(receiveStatus);recvTop.add(receiveFiles);recvTop.add(receiveCount);recvTop.add(receiveProgress);
         recv.add(recvTop,BorderLayout.NORTH);recv.add(new JBScrollPane(receiveTable),BorderLayout.CENTER);
         tabs.addTab("发送",send);tabs.addTab("接收",recv);add(tabs,BorderLayout.CENTER);
         for(JBTable table:List.of(sendTable,receiveTable)){
@@ -73,7 +74,7 @@ public final class SyncPanel extends JPanel implements Disposable {
         generate.addActionListener(e->generate(false));acceptReceipt.addActionListener(e->readReceipt());
         incremental.addActionListener(e->generate(true));receipt.addActionListener(e->copyReceipt());
         prev.addActionListener(e->{part--;updateEnabled();});next.addActionListener(e->{part++;updateEnabled();});
-        copy.addActionListener(e->{try{CopyPasteManager.getInstance().setContents(new StringSelection(outgoing.get(part)));int sent=part;copied.set(part);part=Math.min(copied.nextClearBit(0),outgoing.size()-1);updateEnabled();message("已复制第 "+(sent+1)+" / "+outgoing.size()+" 块");}catch(Exception ex){error(ex);}});
+        copy.addActionListener(e->{try{CopyPasteManager.getInstance().setContents(new StringSelection(outgoing.get(part)));copied.set(part);part=Math.min(copied.nextClearBit(0),outgoing.size()-1);updateEnabled();sendStatus.setText("");}catch(Exception ex){error(ex);}});
         paste.addActionListener(e->{try{String text=CopyPasteManager.getInstance().getContents(DataFlavor.stringFlavor);receive(text);}catch(Exception ex){error(ex);}});
         apply.addActionListener(e->apply());clear.addActionListener(e->clear());clearSend.addActionListener(e->clearSend());
         updateEnabled();
@@ -90,7 +91,7 @@ public final class SyncPanel extends JPanel implements Disposable {
     private String id(){Config.Mapping m=(Config.Mapping)projects.getSelectedItem();return m==null?"":m.id();}
     private void message(String text){status.setText(text);(tabs.getSelectedIndex()==1?receiveStatus:sendStatus).setText(text);}
     private void error(Throwable e){message(e.getMessage()==null?e.toString():e.getMessage());Messages.showErrorDialog(project,status.getText(),"Every Sync");}
-    private void reset(){outgoing=List.of();copied.clear();refRows=List.of();part=0;incoming=null;preview=null;session=null;sendChanges=List.of();receiveChanges=List.of();sendModel.setRowCount(0);receiveModel.setRowCount(0);packet.setVisible(false);receiveCount.setText("等待接收");receiveProgress.setValue(0);sendStatus.setText("");receiveStatus.setText("");updateEnabled();}
+    private void reset(){outgoing=List.of();copied.clear();refRows=List.of();part=0;incoming=null;preview=null;session=null;sendChanges=List.of();receiveChanges=List.of();sendModel.setRowCount(0);receiveModel.setRowCount(0);packet.setVisible(false);receiveCount.setText("等待接收");receiveProgress.setValue(0);sendStatus.setText("");receiveStatus.setText("");sendFiles.setText("");receiveFiles.setText("");updateEnabled();}
     private void labels(){
         if(config==null)return;roleLabel.setText(config.role().name());boolean host=config.role()==Role.HOST;
         generate.setText(host?"生成传输":"生成全量");incremental.setVisible(!host);
@@ -107,41 +108,56 @@ public final class SyncPanel extends JPanel implements Disposable {
     }
     private void fill(DefaultTableModel model,List<Change> changes){model.setRowCount(0);for(Change c:changes)model.addRow(new Object[]{c.status(),c.path()});}
     private void generate(boolean delta){
-        if(config.role()==Role.VM&&Messages.showYesNoDialog(project,"传输包含整个 refs 可达历史，包括排除规则过滤的历史文件。新传输会替换待确认回执目标。确认允许传输？","生成"+(delta?"增量":"全量"),Messages.getWarningIcon())!=Messages.YES)return;
+        if(config.role()==Role.VM && !new TransferConfirmDialog(project,
+                "生成"+(delta?"增量":"全量"), "是否确认生成"+(delta?"增量":"全量")+"传输？").showAndGet())return;
         FileDocumentManager.getInstance().saveAllDocuments();Config cfg=config;String selected=id();
         // Clear the previous package before scanning, so failure cannot leave a stale copy action enabled.
-        outgoing=List.of();copied.clear();packet.setVisible(false);
-        job("生成传输",()->{SyncEngine.Generated result=cfg.role()==Role.HOST?new SyncEngine(workspace,cfg).generate(selected):new BundleSync(workspace,cfg).generate(selected,delta);List<String> parts=ClipboardTransport.split(result.payload(),cfg.chunkKb());return new SendResult(result,parts,cfg.role()==Role.VM?new BundleSync(workspace,cfg).refChanges(selected):List.of());},result->{
-            sendChanges=result.generated.changes();refRows=result.refs;fill(sendModel,sendChanges);if(cfg.role()==Role.VM){sendModel.setRowCount(0);for(GitHistory.RefChange row:refRows)sendModel.addRow(new Object[]{row.status(),row.label()});}
-            if(result.generated.payload().git()!=null)sendCaches.add(result.generated.payload().git().snapshot());
-            outgoing=result.parts;part=0;packet.setVisible(!outgoing.isEmpty());message("已生成 "+outgoing.size()+" 块");
+        outgoing=List.of();copied.clear();packet.setVisible(false);sendFiles.setText("");
+        job("生成传输",()->new ProjectTransferService(workspace,cfg).generate(selected,delta),result->{
+            sendChanges=result.generated().changes();refRows=result.refs();fill(sendModel,sendChanges);if(cfg.role()==Role.VM){sendModel.setRowCount(0);for(GitHistory.RefChange row:refRows)sendModel.addRow(new Object[]{row.status(),row.label()});}
+            if(result.generated().payload().git()!=null)sendCaches.add(result.generated().payload().git().snapshot());
+            outgoing=result.parts();part=0;packet.setVisible(!outgoing.isEmpty());sendFiles.setText("已生成 · 包内文件 "+result.generated().payload().entries().size()+" 个");sendStatus.setText("");
         });
     }
-    private record SendResult(SyncEngine.Generated generated,List<String> parts,List<GitHistory.RefChange> refs){}
     private void receive(String text){
         if(text==null||text.isBlank()){error(new IllegalArgumentException("剪贴板中没有文本"));return;}
         FileDocumentManager.getInstance().saveAllDocuments();
-        Config cfg=config;String selected=id();preview=null;incoming=null;receiveChanges=List.of();fill(receiveModel,receiveChanges);
-        job("接收并预览",()->{
-            ClipboardTransport.Received received=ClipboardTransport.receive(workspace,cfg,selected,text);
-            if(received.payload()!=null&&received.payload().type()==Type.ACK)throw new IllegalArgumentException("请在发送页接收回执");
-            return new ReceiveResult(received,received.payload()==null?null:new SyncEngine(workspace,cfg).preview(selected,received.payload()));
-        },prepared->{
+        Config cfg=config;String selected=id();preview=null;incoming=null;receiveChanges=List.of();fill(receiveModel,receiveChanges);receiveFiles.setText("");
+        job("接收并预览",()->new ProjectTransferService(workspace,cfg).receive(selected,text),prepared->{
             ClipboardTransport.Received result=prepared.received();
             session=result.session();incoming=result.payload();receiveCount.setText("会话 "+session.substring(0,8)+" · "+result.received()+" / "+result.total()+" 块 · 最小未粘贴块号："+(result.firstMissing()==0?"无（已收齐）":result.firstMissing()));
             receiveProgress.setMaximum(result.total());receiveProgress.setValue(result.received());
-            preview=prepared.preview();if(preview!=null){receiveChanges=preview.changes;fill(receiveModel,receiveChanges);}
-            message(preview==null?"接收中":"可应用 · "+receiveChanges.size()+" 个文件变化");
+            receiveFiles.setText(incoming==null?"":"已接收 · 包内文件 "+incoming.entries().size()+" 个");
+            SyncEngine.Preview candidate=prepared.preview();
+            if(candidate!=null&&!candidate.conflicts.isEmpty()){
+                busy=true;updateEnabled();message("等待解决 "+candidate.conflicts.size()+" 个冲突");
+                MergeDialogs.resolve(project,candidate.conflicts,resolutions->{
+                    if(disposed)return;busy=false;FileDocumentManager.getInstance().saveAllDocuments();
+                    job("生成合并预览",()->new SyncEngine(workspace,cfg).resolve(candidate,resolutions),this::showPreview);
+                },()->{if(!disposed){busy=false;preview=null;incoming=null;receiveChanges=List.of();fill(receiveModel,receiveChanges);message("已取消，本次未应用");updateEnabled();}},failure->{if(!disposed){busy=false;preview=null;updateEnabled();error(failure);}});
+            }else showPreview(candidate);
         });
     }
-    private record ReceiveResult(ClipboardTransport.Received received,SyncEngine.Preview preview){}
+    private void showPreview(SyncEngine.Preview candidate){
+        preview=candidate;
+        if(preview!=null){
+            receiveChanges=preview.changes;
+            fill(receiveModel,receiveChanges);
+            receiveFiles.setText("已接收 · 包内文件 "+preview.payload.entries().size()+" 个 · 待应用 "+receiveChanges.size()+" 个");
+        }
+        message(preview==null?"接收中":"可应用");
+    }
     private void apply(){
         if(preview==null)return;boolean host=config.role()==Role.HOST;
-        ConfirmDialog dialog=new ConfirmDialog(project,host,preview.root,preview.changes.size(),preview.payload);if(!dialog.showAndGet())return;
+        String details="目标："+preview.root+"\n来源 HEAD："+preview.payload.head()
+                +(host?"":"\n来源分支："+(preview.payload.sourceBranch().isEmpty()?"detached":preview.payload.sourceBranch()));
+        if(!new TransferConfirmDialog(project,"确认应用",details).showAndGet())return;
         FileDocumentManager.getInstance().saveAllDocuments();Config cfg=config;SyncEngine.Preview accepted=preview;preview=null;
         job("应用代码同步（请勿编辑文件或操作 Git）",()->new SyncEngine(workspace,cfg).apply(accepted),backup->{
             VirtualFileManager.getInstance().asyncRefresh(()->{});incoming=null;receiveChanges=List.of();fill(receiveModel,receiveChanges);
             outgoing=List.of();copied.clear();packet.setVisible(false);sendChanges=List.of();refRows=List.of();fill(sendModel,sendChanges);
+            sendFiles.setText("");
+            receiveFiles.setText("已接收 · 包内文件 "+accepted.payload.entries().size()+" 个 · 已应用 "+accepted.changes.size()+" 个");
             message("应用成功");
         },true);
     }
@@ -166,13 +182,13 @@ public final class SyncPanel extends JPanel implements Disposable {
     private void clear(){
         if(session==null)return;
         if(Messages.showYesNoDialog(project,"删除当前会话已保存的分块？不会删除代码、基线或备份。","清理收件箱",Messages.getQuestionIcon())!=Messages.YES)return;
-        String selected=session;job("清理当前收件会话",()->{ClipboardTransport.clear(workspace,selected);return true;},unused->{incoming=null;preview=null;session=null;receiveModel.setRowCount(0);receiveChanges=List.of();receiveCount.setText("已清理当前会话");receiveProgress.setValue(0);message("当前会话分块已永久删除；需要时可重新发送。");});
+        String selected=session;job("清理当前收件会话",()->{ClipboardTransport.clear(workspace,selected);return true;},unused->{incoming=null;preview=null;session=null;receiveModel.setRowCount(0);receiveChanges=List.of();receiveFiles.setText("");receiveCount.setText("已清理当前会话");receiveProgress.setValue(0);message("当前会话分块已永久删除；需要时可重新发送。");});
     }
     private void clearSend(){
         if(Messages.showYesNoDialog(project,"清空发送分块和临时缓存？未复制的块需重新生成。同步基线及待确认回执保留。","清空发送会话",Messages.getQuestionIcon())!=Messages.YES)return;
         Set<String> caches=Set.copyOf(sendCaches);
         job("清理发送缓存",()->{for(String cache:caches)SafeFiles.clearOutgoing(workspace,"git-outgoing",cache);return true;},unused->{
-            sendCaches.removeAll(caches);outgoing=List.of();copied.clear();part=0;sendChanges=List.of();refRows=List.of();sendModel.setRowCount(0);packet.setVisible(false);sendStatus.setText("发送会话已清空");
+            sendCaches.removeAll(caches);outgoing=List.of();copied.clear();part=0;sendChanges=List.of();refRows=List.of();sendModel.setRowCount(0);packet.setVisible(false);sendFiles.setText("");sendStatus.setText("发送会话已清空");
         });
     }
     private void showDiff(List<Change> changes,int index,boolean sending){
@@ -232,12 +248,4 @@ public final class SyncPanel extends JPanel implements Disposable {
         }.queue();
     }
     @Override public void dispose(){disposed=true;incoming=null;preview=null;outgoing=List.of();sendChanges=List.of();receiveChanges=List.of();}
-    private static final class ConfirmDialog extends DialogWrapper{
-        private final boolean host;private final Path root;private final int count;private final Payload payload;
-        ConfirmDialog(Project p,boolean host,Path root,int count,Payload payload){super(p);this.host=host;this.root=root;this.count=count;this.payload=payload;setTitle("确认应用 · "+count+" 个文件");setOKButtonText("确认应用");setCancelButtonText("取消");init();setOKActionEnabled(false);}
-        @Override protected JComponent createCenterPanel(){
-            JPanel p=vertical();p.setPreferredSize(JBUI.size(540,310));p.add(note("目标："+root+"\nVM HEAD："+payload.head()+"\n"+(host?"按 VM 全量基线 + 增量还原完整项目；所有未排除本地修改作废（包括不在增量清单中的修改），额外文件删除。Bundle 同步还会对齐内层 Git HEAD 和暂存区，历史保留在内层仓库；不操作外层仓库。":"重新校验 VM HEAD 和目标文件基线；不匹配则整包拒绝。")+"\n应用前保存备份。请暂停其他编辑、构建和 Git 操作。"));
-            JCheckBox agree=new JCheckBox(host?"我确认以 VM 快照覆盖本地项目":"我确认将修改写入 VM 工作区（不提交）");agree.addActionListener(e->setOKActionEnabled(agree.isSelected()));p.add(agree);return p;
-        }
-    }
 }

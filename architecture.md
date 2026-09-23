@@ -1,4 +1,14 @@
-# Every Sync 4.2 architecture
+# Every Sync 4.3.2 architecture
+
+4.3.2 maintenance: ProjectTransferService prepares sending and complete-receive previews without UI dependencies. GitCommandRunner owns the existing fixed-command IO/security policy; GitImportTransaction owns isolated verification, metadata snapshots, dedicated-ref updates and rollback. GitHistory retains refs, diffs and bundle generation. SyncEngine keeps file transaction ordering and separates VM snapshot/HOST worktree generation.
+
+ClipboardTransport is a stable facade over ProjectChunkCodec (wire parsing/encoding) and ProjectInbox (persistence/reassembly). Incomplete reception validates the incoming block and identical duplicates, enumerates safe numbered files and computes the gap; it does not read prior content. Completion revalidates every persisted block/signature/index, whole checksum, protocol/body fields and exclusion policy before returning a payload. Existing on-disk formats and UI completion→preview sequence remain unchanged. Progress counts persisted indexes, not independently revalidated old content, until completion.
+
+TestRunner provides explicit groups with summary-only console output and detailed disk logs. No default full suite; see MAINTENANCE.md.
+
+4.3.1: HOST hostChanges unions tracked HEAD→Working Tree changes with `git ls-files --others --exclude-standard -z`, respecting plugin exclusions. Paths already present in the tracked change set take priority, preserving HEAD BASE for staged deletions followed by recreation. Both initial and final consistency scans use the same union. No index mutation or VM generation change.
+
+4.3: HOST generates tracked HEAD→Working Tree changes independently of received baselines. V3 WORKTREE carries BASE and THEIRS bytes plus source HEAD/branch. VM preview compares BASE/OURS/THEIRS through ThreeWayMerge; clean text uses content-only git merge-file in temporary storage. Conflicts are exposed on Preview, and apply rejects unresolved previews. MergeDialogs uses IDEA native text/binary merge with in-memory virtual outputs. Any cancel discards resolutions; complete resolutions produce a new Preview retaining the original before-map for stale checks. No VM HEAD equality check; no VM index/history writes. Git stdout and stderr are drained separately so warnings cannot corrupt path/blob/merge bytes.
 
 4.2.2 UI: generation combines scanning/packing/chunking; single-file selection triggers preparation. Clipboard reception and complete-payload preview run in one background task, returning the preview with the received result; no deferred ToolWindow callback or busy-gated preview continuation. ACK acceptance is a separate send-page action. Copy returns to the first missing index after either automatic or manual selection. Transport/core rules are unchanged.
 
@@ -13,8 +23,10 @@ VM is authoritative. Each mapped HOST business root has independent Git history.
 | Config / SafeFiles | Explicit mappings, exclusions, safe paths, scans, atomic writes |
 | Model / Codec | Versioned payloads, hashes, optional Git metadata |
 | TextPatch | Exact UTF-8 worktree patching |
-| ClipboardTransport | Manual VMSYNC/1 and /2 chunks, integrity, persisted reassembly |
-| GitReader / GitHistory | Root/HEAD queries; bundles, isolated verification, controlled Git import and rollback |
+| ClipboardTransport / ProjectChunkCodec / ProjectInbox | Stable facade; V1/V2/V3 framing; persistent chunk reassembly |
+| GitReader / GitHistory | Root/HEAD, refs/diffs and bundle creation |
+| GitCommandRunner / GitImportTransaction | Fixed-command IO; controlled HOST import and rollback |
+| ProjectTransferService | Background send preparation and receive→preview |
 | BundleSync | Pending target, acknowledged baseline, authoritative reconstruction, receipts |
 | SyncEngine | File generation, preview, stale checks, backups, apply/rollback |
 | SyncPanel / SettingsDialog | Project-only main header, Settings-only role; full/increment and ACK actions |
@@ -27,7 +39,7 @@ HOST receive → verify → reconstruct complete target → preview → explicit
 HOST copy ACK → VM explicitly accepts exact pending snapshot/parent/HEAD/policy → persist acknowledged target.
 Next increment uses that target. Regeneration supersedes pending state. One receiver chain per project; restart reloads disk state.
 
-DELTA applies to pristine baseline, never edited HOST bytes. Complete resulting map is compared against HOST so even edits outside delta and extras are discarded. Exclusions retain worktree bytes. HOST→VM WORKTREE checks HEAD and per-file originals and never changes VM Git.
+DELTA applies to pristine baseline, never edited HOST bytes. Complete resulting map is compared against HOST so even edits outside delta and extras are discarded. Exclusions retain worktree bytes. HOST→VM WORKTREE uses three-way content decisions and stale worktree checks, never changes VM Git.
 
 ## Git transaction
 

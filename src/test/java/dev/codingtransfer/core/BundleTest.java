@@ -5,17 +5,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 import static dev.codingtransfer.core.Model.*;
+import static dev.codingtransfer.core.TestSupport.git;
 
 final class BundleTest {
     private static int checks;
     private interface Checked{void run()throws Exception;}
-    private static void check(boolean ok,String name){if(!ok)throw new AssertionError(name);checks++;System.out.println("PASS BUNDLE "+name);}
+    private static void check(boolean ok,String name){TestSupport.check(ok,name);checks++;System.out.println("PASS BUNDLE "+name);}
     private static void fails(String name,Checked work)throws Exception{try{work.run();}catch(IOException e){check(true,name+" ["+e.getMessage().split("\n")[0]+"]");return;}throw new AssertionError("Expected failure: "+name);}
-    private static String git(Path root,String... args)throws Exception{
-        List<String> command=new ArrayList<>(List.of("git","-C",root.toString()));command.addAll(List.of(args));Process p=new ProcessBuilder(command).redirectErrorStream(true).start();String text=new String(p.getInputStream().readAllBytes(),StandardCharsets.UTF_8).strip();if(p.waitFor()!=0)throw new IOException(text);return text;
-    }
+
     private static void write(Path root,String name,String value)throws IOException{Path p=root.resolve(name);Files.createDirectories(p.getParent());Files.writeString(p,value);}
-    private static void init(Path root)throws Exception{Files.createDirectories(root);git(root,"init","-q","-b","main");git(root,"config","user.name","Test");git(root,"config","user.email","test@example.invalid");}
+    private static void init(Path root)throws Exception{TestSupport.initRepository(root);}
     private static void commit(Path root,String message)throws Exception{git(root,"add","a.txt","stable.txt");git(root,"commit","-qm",message);}
     private static Config cfg(Role role,Path vm){return new Config(role,List.of(new Config.Mapping("demo","project",vm.toString())),List.of("target/**","*.log"),4,"git");}
     private static Payload wire(Path workspace,Config cfg,Payload p)throws Exception{
@@ -63,7 +62,7 @@ final class BundleTest {
         git(vm,"checkout","--detach",first);Payload older=sender.generate("demo",true).payload();engine.apply(engine.preview("demo",older));check(git(root,"rev-parse","HEAD").equals(first),"increment supports historical detached checkout");sender.acceptReceipt("demo",receiver.receipt("demo"));
         Payload replacement=sender.generate("demo",false).payload();engine.apply(engine.preview("demo",replacement));check(git(root,"rev-parse","HEAD").equals(first),"full reinitialization retained after increments");
         write(root,"a.txt","HOST proposal\n");String vmIndex=hash(Files.readAllBytes(vm.resolve(".git/index")));
-        Payload proposal=new SyncEngine(host,hc).generate("demo").payload();check(proposal.type()==Type.WORKTREE&&proposal.entries().size()==1,"HOST worktree generation after bundle baseline");
+        Payload proposal=new SyncEngine(host,hc).generate("demo").payload();check(proposal.type()==Type.WORKTREE&&proposal.entries().stream().map(Entry::path).collect(java.util.stream.Collectors.toSet()).equals(Set.of("a.txt","dirty.txt")),"HOST worktree generation includes nonignored untracked draft after bundle baseline");
         SyncEngine vmEngine=new SyncEngine(vm,vc);vmEngine.apply(vmEngine.preview("demo",proposal));
         check(Files.readString(vm.resolve("a.txt")).equals("HOST proposal\n")&&hash(Files.readAllBytes(vm.resolve(".git/index"))).equals(vmIndex),"reverse HOST→VM applies without changing VM index");
         check(git(host,"rev-parse","HEAD").equals(outerHead)&&hash(Files.readAllBytes(host.resolve(".git/index"))).equals(outerIndex)&&Files.readString(host.resolve("outer.txt")).equals("outer"),"outer HOST Git HEAD index and document untouched");

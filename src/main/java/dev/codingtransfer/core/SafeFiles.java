@@ -112,7 +112,7 @@ public final class SafeFiles {
         Path ignore=p.resolve(".gitignore");noLinks(ignore);
         String rules=Files.exists(ignore)?new String(read(ignore,64*1024),java.nio.charset.StandardCharsets.UTF_8):"";
         String updated=rules;
-        for(String rule:List.of("baselines/","inbox/","file-inbox/","file-outgoing/","backups/","locks/","bundle-state/","git-staging/","git-outgoing/","disabled-hooks/","*.tmp"))
+        for(String rule:List.of("baselines/","inbox/","file-inbox/","file-outgoing/","backups/","locks/","bundle-state/","git-staging/","git-outgoing/","merge-staging/","disabled-hooks/","*.tmp"))
             if(!Arrays.asList(updated.split("\n")).contains(rule))updated+=(updated.isEmpty()||updated.endsWith("\n")?"":"\n")+rule+"\n";
         if(!updated.equals(rules))atomicWrite(ignore,updated.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         return p;

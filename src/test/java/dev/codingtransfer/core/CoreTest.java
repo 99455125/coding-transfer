@@ -6,6 +6,7 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.zip.*;
 import static dev.codingtransfer.core.Model.*;
+import static dev.codingtransfer.core.TestSupport.git;
 
 /** Integration tests use disposable local repositories, never the user's repositories. */
 public final class CoreTest {
@@ -13,25 +14,27 @@ public final class CoreTest {
     private static Path temp;
     private static final String HEAD="0123456789abcdef0123456789abcdef01234567";
     private interface Checked {void run() throws Exception;}
-    private static void check(boolean value,String name){if(!value)throw new AssertionError(name);checks++;System.out.println("PASS "+name);}
+    private static void check(boolean value,String name){TestSupport.check(value,name);checks++;System.out.println("PASS "+name);}
     private static void fails(String name,String contains,Checked work)throws Exception{
         try{work.run();}catch(IOException e){check(e.getMessage()!=null&&e.getMessage().contains(contains),name+" ["+e.getMessage().split("\n")[0]+"]");return;}throw new AssertionError("Expected failure: "+name);
     }
     private static byte[] bytes(String s){return s.getBytes(StandardCharsets.UTF_8);}
     private static void write(Path root,String path,byte[] data)throws IOException{Path p=root.resolve(path);Files.createDirectories(p.getParent());Files.write(p,data);}
-    private static String git(Path root,String... arguments)throws Exception{
-        List<String> command=new ArrayList<>(List.of("git","-C",root.toString()));command.addAll(List.of(arguments));
-        Process p=new ProcessBuilder(command).redirectErrorStream(true).start();String out=new String(p.getInputStream().readAllBytes(),StandardCharsets.UTF_8).strip();if(p.waitFor()!=0)throw new IOException(out);return out;
-    }
     private static Config config(Role role,Path repo)throws Exception{
         return Config.parse("role: "+role+"\ngit: git\nprojects:\n  - id: ri-core\n    local: projects/ri-core\n    vm: '"+repo+"'\n  - id: pangu\n    local: projects/pangu\n    vm: '"+repo.resolveSibling("pangu")+"'\nexclude:\n  - .idea/**\n  - target/**\n  - build/**\n  - node_modules/**\n  - '*.log'\nclipboard:\n  chunk-size-kb: 4\n");
     }
     private static Payload payload(Config c,List<Entry> entries){return new Payload(Type.SNAPSHOT,"ri-core",HEAD,c.policy(),entries);}
     private static Entry raw(String path,byte[] b){return new Entry(path,"-",hash(b),Encoding.RAW,b);}
-    public static void main(String[] args)throws Exception{
-        temp=Files.createTempDirectory("coding-transfer-test-").toRealPath();System.out.println("Test workspace: "+temp);
-        try{configuration();patches();codec();transport();integration();recovery();flexibleMappings();System.out.println("PASS ALL "+checks+" checks");BundleTest.run(temp);FileTransferTest.run(temp);RefsTest.run(temp);}
-        finally{try(var paths=Files.walk(temp)){for(Path p:paths.sorted(Comparator.reverseOrder()).toList())Files.delete(p);}}
+    public static void main(String[] args)throws Exception{TestRunner.main(args);}
+    static void run(String group,Path fixture)throws Exception{
+        temp=fixture;
+        checks=0;
+        if(group.equals("core")){
+            configuration();patches();integration();recovery();flexibleMappings();
+        }else if(group.equals("transport")){
+            codec();transport();
+        }else throw new IllegalArgumentException(group);
+        System.out.println("PASS ALL "+checks+" "+group+" checks");
     }
     private static void configuration()throws Exception{
         Config c=config(Role.HOST,temp.resolve("vm"));check(c.projects().size()==2,"multiple project mappings");check(Config.parse(c.yaml()).equals(c),"configuration round trip");
@@ -111,47 +114,51 @@ public final class CoreTest {
     private static void integration()throws Exception{
         Path vm=Files.createDirectories(temp.resolve("vm-repo")),host=Files.createDirectories(temp.resolve("host-workspace"));
         git(vm,"init");git(vm,"config","user.name","Transfer Test");git(vm,"config","user.email","transfer@example.invalid");
+        git(vm,"config","core.autocrlf","false");
         write(vm,"src/Main.java",bytes("class Main {\r\n}\r\n"));write(vm,"delete.txt",bytes("remove later\n"));write(vm,"empty",new byte[0]);write(vm,"binary.bin",new byte[]{0,1,2});
         git(vm,"add",".");git(vm,"commit","-m","initial");String initial=git(vm,"rev-parse","HEAD");
         write(vm,"untracked.txt",bytes("dirty snapshot\n"));write(vm,"target/ignored",bytes("build"));
         write(host,"AGENTS.md",bytes("AI only"));write(host,"requirements/001/plan.md",bytes("plan"));write(host,"docs/design.md",bytes("docs"));write(host,"projects/pangu/Other.java",bytes("other project"));
         git(host,"init");git(host,"config","user.name","Host Test");git(host,"config","user.email","host@example.invalid");git(host,"add",".");git(host,"commit","-m","outer history");
         Config hc=config(Role.HOST,vm),vc=config(Role.VM,vm);SyncEngine he=new SyncEngine(host,hc),ve=new SyncEngine(vm,vc);
-        fails("HOST requires baseline","NO_BASELINE",()->he.generate("ri-core"));
-        SyncEngine.Generated snap=ve.generate("ri-core");check(snap.payload().head().equals(initial)&&snap.payload().entries().size()==5,"VM snapshot includes dirty untracked, excludes target/Git");
+        fails("HOST requires local repository","仓库",()->he.generate("ri-core"));
+        SyncEngine.Generated snap=new BundleSync(vm,vc).generate("ri-core",false);check(snap.payload().head().equals(initial)&&snap.payload().entries().size()==5,"VM snapshot includes dirty untracked, excludes target/Git");
         Path mirror=host.resolve("projects/ri-core");SyncEngine.Preview initialPreview=he.preview("ri-core",Codec.decode(Codec.encode(snap.payload())));he.apply(initialPreview);
         check(Arrays.equals(Files.readAllBytes(mirror.resolve("src/Main.java")),Files.readAllBytes(vm.resolve("src/Main.java"))),"initial authoritative snapshot applied");
-        check(!Files.exists(mirror.resolve(".git")),"HOST project has no nested Git");
-        check(he.generate("ri-core").changes().isEmpty(),"HOST baseline produces zero changes");
+        check(Files.exists(mirror.resolve(".git")),"HOST has independent inner Git");
+        check(he.generate("ri-core").payload().entries().size()==1&&he.generate("ri-core").payload().entries().getFirst().path().equals("untracked.txt"),"nonignored untracked snapshot file is forwarded as Add");
         write(mirror,"src/Main.java",bytes("class Main {\r\n  int value = 1;\r\n}\r\n"));write(mirror,"new/中文.java",bytes("// 中文\n"));write(mirror,"binary.bin",new byte[]{0,9,8,7});Files.delete(mirror.resolve("delete.txt"));
+        git(mirror,"add","new/中文.java");
         write(host,"AGENTS.md",bytes("changed AI only"));write(host,"projects/pangu/Other.java",bytes("changed other"));
         git(host,"add",".");git(host,"commit","-m","AI outer commit does not become VM BASE");
-        SyncEngine.Generated change=he.generate("ri-core");check(change.payload().head().equals(initial)&&change.changes().size()==4,"HOST worktree ignores outer commits and other projects");
-        check(change.payload().entries().stream().anyMatch(e->e.encoding()==Encoding.PATCH)&&change.payload().entries().stream().anyMatch(e->e.encoding()==Encoding.DELETE),"worktree contains patch and deletion");
+        SyncEngine.Generated change=he.generate("ri-core");check(change.payload().head().equals(initial)&&change.changes().size()==5,"HOST worktree ignores outer commits and other projects");
+        check(change.payload().entries().stream().anyMatch(e->e.base()!=null)&&change.payload().entries().stream().anyMatch(e->e.encoding()==Encoding.DELETE),"worktree contains BASE bytes and deletion");
         byte[] indexBefore=Files.readAllBytes(vm.resolve(".git/index"));String headBefore=GitReader.head(vm,"git");
         SyncEngine.Preview preview=ve.preview("ri-core",Codec.decode(Codec.encode(change.payload())));Path backup=ve.apply(preview);
         check(Arrays.equals(Files.readAllBytes(vm.resolve("src/Main.java")),Files.readAllBytes(mirror.resolve("src/Main.java"))),"HOST changes applied preserving exact CRLF");
         check(!Files.exists(vm.resolve("delete.txt"))&&Files.exists(vm.resolve("new/中文.java")),"add/delete applied");
         check(Arrays.equals(indexBefore,Files.readAllBytes(vm.resolve(".git/index")))&&headBefore.equals(GitReader.head(vm,"git")),"VM index and HEAD unchanged");
         check(Files.exists(backup.resolve("before.gz"))&&Files.readString(backup.resolve("status.txt")).equals("APPLIED"),"durable pre/post backup and journal");
-        fails("repeated worktree not blindly reapplied","BASE_CONTENT",()->ve.preview("ri-core",change.payload()));
-        check(he.generate("ri-core").changes().size()==4,"sending does not advance HOST baseline");
+        check(ve.preview("ri-core",change.payload()).changes.isEmpty(),"repeated identical worktree becomes no-op");
+        check(he.generate("ri-core").changes().size()==5,"sending does not advance HOST baseline");
         git(vm,"add",".");git(vm,"commit","-m","VM owns formal commit");
-        fails("HEAD mismatch rejected","BASE_MISMATCH",()->ve.preview("ri-core",change.payload()));
+        check(ve.preview("ri-core",change.payload()).changes.isEmpty(),"advanced VM HEAD does not reject identical proposal");
         write(mirror,"local-only.txt",bytes("will remove"));write(mirror,"src/Main.java",bytes("conflicting local draft"));write(mirror,"target/keep",bytes("preserve build"));
-        SyncEngine.Preview authoritative=he.preview("ri-core",ve.generate("ri-core").payload());he.apply(authoritative);
+        SyncEngine.Preview authoritative=he.preview("ri-core",new BundleSync(vm,vc).generate("ri-core",false).payload());he.apply(authoritative);
         check(!Files.exists(mirror.resolve("local-only.txt"))&&Arrays.equals(Files.readAllBytes(vm.resolve("src/Main.java")),Files.readAllBytes(mirror.resolve("src/Main.java"))),"VM snapshot overrides HOST conflicts and removes extras");
         check(Files.readString(mirror.resolve("target/keep")).equals("preserve build"),"excluded local files preserved");
         check(Files.readString(host.resolve("AGENTS.md")).equals("changed AI only")&&Files.readString(host.resolve("projects/pangu/Other.java")).equals("changed other"),"AI root and unrelated project untouched");
         check(he.generate("ri-core").changes().isEmpty(),"new VM snapshot advances baseline");
         write(mirror,"src/Main.java",bytes("host edit\n"));Payload nextChange=he.generate("ri-core").payload();write(vm,"src/Main.java",bytes("parallel VM edit\n"));
-        fails("same HEAD dirty VM target protected","BASE_CONTENT",()->ve.preview("ri-core",nextChange));
-        he.apply(he.preview("ri-core",ve.generate("ri-core").payload()));
+        check(!ve.preview("ri-core",nextChange).conflicts.isEmpty(),"same HEAD dirty VM enters conflict resolution");
+        he.apply(he.preview("ri-core",new BundleSync(vm,vc).generate("ri-core",false).payload()));
         write(mirror,"src/Main.java",bytes("host edit again\n"));Payload pending=he.generate("ri-core").payload();SyncEngine.Preview stale=ve.preview("ri-core",pending);write(vm,"untracked.txt",bytes("changed since preview"));
-        fails("stale preview refused before writes","STALE_PREVIEW",()->ve.apply(stale));
+        if(!stale.conflicts.isEmpty()){Map<String,byte[]> choices=new HashMap<>();for(var c:stale.conflicts)choices.put(c.path(),c.theirs());
+            fails("stale conflict resolution refused before writes","STALE_PREVIEW",()->ve.resolve(stale,choices));
+        }else fails("stale preview refused before writes","STALE_PREVIEW",()->ve.apply(stale));
         check(Files.readString(vm.resolve("src/Main.java")).equals("parallel VM edit\n"),"stale rejection makes no target writes");
         git(vm,"add",".");git(vm,"commit","-m","save disposable test work");git(vm,"checkout","--detach",initial);
-        he.apply(he.preview("ri-core",ve.generate("ri-core").payload()));check(he.generate("ri-core").payload().head().equals(initial),"VM historical checkout snapshot accepted as authority");
+        he.apply(he.preview("ri-core",new BundleSync(vm,vc).generate("ri-core",false).payload()));check(he.generate("ri-core").payload().head().equals(initial),"VM historical checkout snapshot accepted as authority");
         Payload excluded=payload(hc,List.of(raw("target/blocked",bytes("x"))));fails("excluded payload refused","排除",()->he.preview("ri-core",excluded));
         fails("snapshot cannot be applied on VM","方向",()->ve.preview("ri-core",snap.payload()));
         fails("project mismatch cannot be applied","项目",()->he.preview("pangu",snap.payload()));
@@ -179,7 +186,7 @@ public final class CoreTest {
             fails("concurrent apply blocked by project lock","另一个同步",()->engine.apply(engine.preview("ri-core",next)));
         }
         check(Arrays.equals(baseline,Files.readAllBytes(host.resolve(".vmsync/baselines/ri-core.gz"))),"all rejected applies preserve baseline");
-        engine.apply(engine.preview("ri-core",next));check(engine.generate("ri-core").changes().isEmpty(),"successful retry after rollback");
+        engine.apply(engine.preview("ri-core",next));check(Files.readString(mirror.resolve("a.txt")).equals("new a"),"successful retry after rollback");
         Path exported=temp.resolve("exported-backup");BackupExport.export(host.resolve(".vmsync/baselines/ri-core.gz"),exported);
         check(Files.readString(exported.resolve("a.txt")).equals("new a"),"manual recovery exports verified bytes");
         fails("backup export never overwrites existing directory","禁止覆盖",()->BackupExport.export(host.resolve(".vmsync/baselines/ri-core.gz"),exported));
@@ -218,12 +225,13 @@ public final class CoreTest {
         engine.apply(engine.preview("ri-core",first));
         check(Files.readString(outside.resolve("src/Main.java")).equals("baseline\r\n"),"snapshot creates and applies to external directory");
         check(!Files.exists(workspace.resolve("projects")),"no forced projects directory created");
+        git(outside,"init","-q");git(outside,"config","user.name","Test");git(outside,"config","user.email","test@example.invalid");git(outside,"add","src/Main.java");git(outside,"commit","-qm","local baseline");
         write(outside,"src/Main.java",bytes("new edit\r\n"));Payload work=engine.generate("ri-core").payload();
         check(work.entries().size()==1&&work.entries().getFirst().path().equals("src/Main.java")&&work.type()==Type.WORKTREE,"external directory produces project-relative WORKTREE");
-        write(outside,"extra.txt",bytes("delete on snapshot"));write(outside,"target/keep",bytes("excluded"));write(outside,".git/config",bytes("local git metadata"));
+        write(outside,"extra.txt",bytes("delete on snapshot"));write(outside,"target/keep",bytes("excluded"));write(outside,".git/keep-marker",bytes("local git metadata"));
         engine.apply(engine.preview("ri-core",first));
         check(!Files.exists(outside.resolve("extra.txt"))&&Files.readString(outside.resolve("target/keep")).equals("excluded"),"external snapshot authoritative replacement respects exclusions");
-        check(Files.readString(outside.resolve(".git/config")).equals("local git metadata"),"external HOST root .git preserved");
+        check(Files.readString(outside.resolve(".git/keep-marker")).equals("local git metadata"),"external HOST root .git preserved");
         check(Files.readString(workspace.resolve("AGENTS.md")).equals("root AI document")&&Files.readString(workspace.resolve("sibling/Untouched.java")).equals("untouched"),"outside mapped root AI/sibling files untouched");
         Path secondWorkspace=Files.createDirectories(temp.resolve("second-IDE-workspace"));SyncEngine second=new SyncEngine(secondWorkspace,absolute);
         try(var channel=java.nio.channels.FileChannel.open(outside.resolve(".vmsync/locks/apply.lock"),StandardOpenOption.WRITE);var held=channel.lock()){

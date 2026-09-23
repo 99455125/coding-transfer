@@ -46,7 +46,7 @@ final class FileTransferPanel extends JPanel implements Disposable {
         JFormattedTextField chunkInput=((JSpinner.DefaultEditor)chunk.getEditor()).getTextField();chunkInput.setFocusLostBehavior(JFormattedTextField.COMMIT);
         chunkInput.addFocusListener(new FocusAdapter(){@Override public void focusLost(FocusEvent e){try{chunk.commitEdit();}catch(java.text.ParseException ex){error(ex);}}});
         previous.addActionListener(e->{part--;update();});next.addActionListener(e->{part++;update();});
-        copy.addActionListener(e->{try{CopyPasteManager.getInstance().setContents(new StringSelection(outgoing.chunks().get(part)));int sent=part;copied.set(part);part=Math.min(copied.nextClearBit(0),outgoing.chunks().size()-1);update();message("已复制第 "+(sent+1)+" / "+outgoing.chunks().size()+" 块");}catch(Exception ex){error(ex);}});
+        copy.addActionListener(e->{try{CopyPasteManager.getInstance().setContents(new StringSelection(outgoing.chunks().get(part)));copied.set(part);part=Math.min(copied.nextClearBit(0),outgoing.chunks().size()-1);update();sendStatus.setText("已生成 · 文件 1 个");}catch(Exception ex){error(ex);}});
         paste.addActionListener(e->{try{receive(CopyPasteManager.getInstance().getContents(DataFlavor.stringFlavor));}catch(Exception ex){error(ex);}});
         save.addActionListener(e->save());clear.addActionListener(e->clear());clearSend.addActionListener(e->clearSend());update();
     }
@@ -62,7 +62,7 @@ final class FileTransferPanel extends JPanel implements Disposable {
     private void generate(){
         try{chunk.commitEdit();}catch(java.text.ParseException e){error(e);return;}
         Path file=selected;int size=((Number)chunk.getValue()).intValue();outgoing=null;copied.clear();update();
-        job("读取文件并生成分块",()->FileTransfer.generate(file,size,workspace),result->{outgoing=result;sendCaches.add(result.metadata().session());part=0;sendInfo.setText(info(result.metadata()));message("已生成");});
+        job("读取文件并生成分块",()->FileTransfer.generate(file,size,workspace),result->{outgoing=result;sendCaches.add(result.metadata().session());part=0;sendInfo.setText(info(result.metadata()));message("已生成 · 文件 1 个");});
     }
     private static String info(FileTransfer.Metadata m){return "文件名："+m.filename()+"\n大小："+m.size()+" bytes\nSHA-256："+m.sha256();}
     private void receive(String value){
@@ -71,7 +71,7 @@ final class FileTransferPanel extends JPanel implements Disposable {
         job("校验并接收文件分块",()->FileTransfer.receive(workspace,value),result->{
             incoming=result;progress.setMaximum(result.metadata().count());progress.setValue(result.received());
             receiveInfo.setText(info(result.metadata())+"\n会话："+result.metadata().session()+"\n已接收："+result.received()+" / "+result.metadata().count()+"\n最小未粘贴块号："+(result.firstMissing()==0?"无（已收齐）":result.firstMissing()));
-            message(result.complete()?"校验通过":"接收中");
+            message(result.complete()?"已接收 · 文件 1 个 · 校验通过":"接收中");
         },()->{incoming=previous;});
     }
     private void save(){
