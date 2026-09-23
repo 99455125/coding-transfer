@@ -1,5 +1,11 @@
 # Validation — Coding Transfer
 
+## 2026-09-23 — Every Sync 4.3.5 mandatory .gitattributes exclusion
+
+- Project file scans and change lists exclude .gitattributes at any directory depth through Config.excluded; receiver-side exclusion checks and preservation use the same rule. Git Bundle history and independent file transfer are unchanged.
+- Policy fingerprint updated: upgrade both ends, regenerate a full VM transfer and acknowledge before incremental use. Ref-list display disregards an incompatible old-policy baseline so full generation can recover; strict incremental baseline checks remain.
+- Release compiled/packaged against IC-251.26094.121. No tests run, as requested. Artifact: dist/every-sync-4.3.5.zip.
+
 ## 2026-09-22 — Every Sync 4.3.4 confirmation button alignment
 
 - Confirmation buttons now share one preferred-width, equal-width grid with an 8-scaled-pixel gap, anchored at the right of a separate full-width bar. Cancel is immediately left of Confirm; text and actions unchanged.

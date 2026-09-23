@@ -22,7 +22,11 @@ public final class BundleSync {
     }
     public List<GitHistory.RefChange> refChanges(String id)throws IOException{
         require(config.role()==Role.VM,"仅 VM 展示整个 refs 的变化");Path root=config.root(workspace,config.project(id));
-        GitHistory.Tips now=GitHistory.tips(root,config.git());Payload base=Files.exists(state("acknowledged",id))?acknowledged(id):null;
+        GitHistory.Tips now=GitHistory.tips(root,config.git());Payload base=null;
+        Path acknowledged=state("acknowledged",id);
+        // Display cannot reuse an old exclusion policy, but must not block a new full transfer.
+        // Incremental generation still requires the strict acknowledged() check.
+        if(Files.exists(acknowledged)&&Codec.decode(SafeFiles.read(acknowledged)).policy().equals(config.policy()))base=acknowledged(id);
         Map<String,String> old=base==null?Map.of():base.git().refs();Set<String> names=new TreeSet<>(old.keySet());names.addAll(now.refs().keySet());
         List<GitHistory.RefChange> rows=new ArrayList<>();
         for(String ref:names)if(!Objects.equals(old.get(ref),now.refs().get(ref)))rows.addAll(GitHistory.refChanges(root,config.git(),ref,old.get(ref),now.refs().get(ref),config));

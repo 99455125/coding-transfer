@@ -129,7 +129,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
     public Mapping project(String id) throws IOException {
         return projects.stream().filter(p -> p.id().equals(id)).findFirst().orElseThrow(() -> new IOException("未登记项目: " + id));
     }
-    public String policy() { return hash(("v1-hard-excludes:.git,.vmsync\n" + String.join("\n", exclude)).getBytes(StandardCharsets.UTF_8)); }
+    public String policy() { return hash(("v2-hard-excludes:.git,.vmsync,.gitattributes\n" + String.join("\n", exclude)).getBytes(StandardCharsets.UTF_8)); }
     public String yaml() {
         StringBuilder out = new StringBuilder("role: " + role + "\ngit: '" + git + "'\nprojects:\n");
         for (Mapping m : projects) out.append("  - id: ").append(m.id()).append("\n    path: '").append(role==Role.HOST?m.local():m.vm()).append("'\n");
@@ -137,7 +137,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
         return out.append("clipboard:\n  chunk-size-kb: ").append(chunkKb).append('\n').toString();
     }
     public boolean excluded(String path) {
-        for (String component : path.split("/")) if (component.equalsIgnoreCase(".git") || component.equalsIgnoreCase(".vmsync")) return true;
+        for (String component : path.split("/")) if (component.equalsIgnoreCase(".git") || component.equalsIgnoreCase(".vmsync") || component.equalsIgnoreCase(".gitattributes")) return true;
         for (String glob : exclude) {
             String pat = glob.endsWith("/**") ? glob.substring(0, glob.length()-3) : glob;
             if (matches(pat, path)) return true;
