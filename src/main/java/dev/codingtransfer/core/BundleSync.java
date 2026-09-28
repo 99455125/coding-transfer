@@ -14,6 +14,13 @@ public final class BundleSync {
         Path path=state("acknowledged",id);require(Files.exists(path),"NO_BASELINE: 请先全量同步，HOST 应用成功后把回执传回 VM 并确认");
         Payload p=Codec.decode(SafeFiles.read(path));require(p.type()==Type.SNAPSHOT&&p.git()!=null&&p.project().equals(id)&&p.policy().equals(config.policy()),"基线/排除规则不匹配，请重新全量同步");return p;
     }
+    public boolean hasUnacknowledgedPending(String id)throws IOException{
+        PendingBundleTransferStore.Transfer inFlight=new PendingBundleTransferStore(workspace).read();if(inFlight==null){TransferSessionStore.Context context=new TransferSessionStore(workspace).currentContext();if(context!=null)return true;return false;}if(!inFlight.projectId().equals(id))return true;
+        Path pending=state("pending",id);if(!Files.exists(pending))return true;Payload sent=Codec.decode(SafeFiles.read(pending));if(sent.git()==null||!sent.git().snapshot().equals(inFlight.transferId()))throw new IOException("正在传输的 VM Bundle 与待确认项目不匹配");
+        Path ack=state("acknowledged",id);if(!Files.exists(ack))return true;Payload accepted=Codec.decode(SafeFiles.read(ack));
+        boolean waiting=accepted.git()==null||!sent.project().equals(accepted.project())||!sent.git().snapshot().equals(accepted.git().snapshot());if(!waiting)new PendingBundleTransferStore(workspace).clear(id,inFlight.session());return waiting;
+    }
+    public void markAutomaticTransferStarted(String projectId,String session,String transferId,int total)throws IOException{require(config.role()==Role.VM,"仅 VM Bundle 需要发送确认标记");Payload pending=Codec.decode(SafeFiles.read(state("pending",projectId)));require(pending.git()!=null&&pending.git().snapshot().equals(transferId),"待确认 Bundle 与自动传输不匹配");new PendingBundleTransferStore(workspace).mark(new PendingBundleTransferStore.Transfer(projectId,session,transferId,total));}
     private static Payload attach(Payload p,GitData git){return new Payload(p.type(),p.project(),p.head(),p.policy(),p.entries(),git);}
     public SyncEngine.Generated scan(String id)throws IOException{
         require(config.role()==Role.VM,"仅 VM 可生成 Bundle");SyncEngine.Generated full=engine.generate(id);
@@ -36,6 +43,7 @@ public final class BundleSync {
     }
     public SyncEngine.Generated generate(String id,boolean incremental)throws IOException{
         require(config.role()==Role.VM,"仅 VM 可生成 Bundle");
+        require(!hasUnacknowledgedPending(id),"PENDING_ACK: 此项目已有待确认 Bundle；先接收并确认 HOST 回执，再生成下一包");
         Payload base=incremental?acknowledged(id):null;SyncEngine.Generated full=engine.generate(id);
         GitHistory.Tips tips=GitHistory.tips(full.root(),config.git());require(tips.head().equals(full.payload().head()),"VM HEAD 已变化，请重新生成");
         String snapshot=UUID.randomUUID().toString(),parent=base==null?"-":base.git().snapshot();
@@ -76,9 +84,10 @@ public final class BundleSync {
         Path ack=state("acknowledged",id);
         if(Files.exists(ack)){
             Payload previous=Codec.decode(SafeFiles.read(ack));
-            if(previous.git().snapshot().equals(sent.git().snapshot()))return;
+            if(previous.git().snapshot().equals(sent.git().snapshot())){var marker=new PendingBundleTransferStore(workspace).read();if(marker!=null)new PendingBundleTransferStore(workspace).clear(id,marker.session());return;}
             require(sent.git().parent().equals("-")||sent.git().parent().equals(previous.git().snapshot()),"回执父基线已过期");
         }else require(sent.git().parent().equals("-"),"缺少回执父基线");
         SafeFiles.atomicWrite(ack,Codec.encode(sent));
+        var marker=new PendingBundleTransferStore(workspace).read();if(marker!=null)new PendingBundleTransferStore(workspace).clear(id,marker.session());
     }
 }

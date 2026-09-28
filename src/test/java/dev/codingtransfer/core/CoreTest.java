@@ -42,8 +42,8 @@ public final class CoreTest {
         check(c.excluded(".git/config")&&c.excluded(".vmsync/config.yaml"),"mandatory state/Git exclusions");
         check(Config.parse(c.yaml().replace("projects/ri-core","services/ri-core")).project("ri-core").local().equals("services/ri-core"),"HOST directory name and depth unrestricted");
         fails("unknown setting rejected","不支持",()->Config.parse(c.yaml()+"execute: rm\n"));
-        fails("chunk size lower bound","4–4096",()->Config.parse(c.yaml().replace("chunk-size-kb: 4","chunk-size-kb: 1")));
-        fails("chunk size upper bound","4–4096",()->Config.parse(c.yaml().replace("chunk-size-kb: 4","chunk-size-kb: 4097")));
+        fails("chunk size lower bound","4–1048576",()->Config.parse(c.yaml().replace("chunk-size-kb: 4","chunk-size-kb: 1")));
+        fails("chunk size upper bound","4–1048576",()->Config.parse(c.yaml().replace("chunk-size-kb: 4","chunk-size-kb: "+(TransferLimits.MAX_CHUNK_KB+1))));
         fails("duplicate id rejected","id 重复",()->Config.parse(c.yaml().replace("id: pangu","id: ri-core")));
         fails("unknown project rejected","未登记",()->c.project("not-registered"));
         for(String path:List.of("../secret","/absolute","a/../../b","a\\b","a//b",".git/config","x/.GiT/config",".vmsync/state","nul.txt","com1.java","a:b","a. ","a/./b"))fails("reject path "+path,"路径",()->SafeFiles.relative(path));
@@ -114,7 +114,7 @@ public final class CoreTest {
     private static void integration()throws Exception{
         Path vm=Files.createDirectories(temp.resolve("vm-repo")),host=Files.createDirectories(temp.resolve("host-workspace"));
         git(vm,"init");git(vm,"config","user.name","Transfer Test");git(vm,"config","user.email","transfer@example.invalid");
-        git(vm,"config","core.autocrlf","false");
+        git(vm,"config","core.autocrlf","false");git(vm,"config","core.safecrlf","false");
         write(vm,"src/Main.java",bytes("class Main {\r\n}\r\n"));write(vm,"delete.txt",bytes("remove later\n"));write(vm,"empty",new byte[0]);write(vm,"binary.bin",new byte[]{0,1,2});
         git(vm,"add",".");git(vm,"commit","-m","initial");String initial=git(vm,"rev-parse","HEAD");
         write(vm,"untracked.txt",bytes("dirty snapshot\n"));write(vm,"target/ignored",bytes("build"));
@@ -126,6 +126,7 @@ public final class CoreTest {
         Path mirror=host.resolve("projects/ri-core");SyncEngine.Preview initialPreview=he.preview("ri-core",Codec.decode(Codec.encode(snap.payload())));he.apply(initialPreview);
         check(Arrays.equals(Files.readAllBytes(mirror.resolve("src/Main.java")),Files.readAllBytes(vm.resolve("src/Main.java"))),"initial authoritative snapshot applied");
         check(Files.exists(mirror.resolve(".git")),"HOST has independent inner Git");
+        Path vmBaseline=vm.resolve(".vmsync/baselines/ri-core.gz");Files.createDirectories(vmBaseline.getParent());SafeFiles.atomicWrite(vmBaseline,Codec.encode(snap.payload()));
         check(he.generate("ri-core").payload().entries().size()==1&&he.generate("ri-core").payload().entries().getFirst().path().equals("untracked.txt"),"nonignored untracked snapshot file is forwarded as Add");
         write(mirror,"src/Main.java",bytes("class Main {\r\n  int value = 1;\r\n}\r\n"));write(mirror,"new/中文.java",bytes("// 中文\n"));write(mirror,"binary.bin",new byte[]{0,9,8,7});Files.delete(mirror.resolve("delete.txt"));
         git(mirror,"add","new/中文.java");
@@ -134,7 +135,9 @@ public final class CoreTest {
         SyncEngine.Generated change=he.generate("ri-core");check(change.payload().head().equals(initial)&&change.changes().size()==5,"HOST worktree ignores outer commits and other projects");
         check(change.payload().entries().stream().anyMatch(e->e.base()!=null)&&change.payload().entries().stream().anyMatch(e->e.encoding()==Encoding.DELETE),"worktree contains BASE bytes and deletion");
         byte[] indexBefore=Files.readAllBytes(vm.resolve(".git/index"));String headBefore=GitReader.head(vm,"git");
-        SyncEngine.Preview preview=ve.preview("ri-core",Codec.decode(Codec.encode(change.payload())));Path backup=ve.apply(preview);
+        SyncEngine.Preview preview=ve.preview("ri-core",Codec.decode(Codec.encode(change.payload())));
+        if(!preview.conflicts.isEmpty()){Map<String,byte[]> choices=new HashMap<>();for(var conflict:preview.conflicts)choices.put(conflict.path(),conflict.theirs());preview=ve.resolve(preview,choices);}
+        Path backup=ve.apply(preview);
         check(Arrays.equals(Files.readAllBytes(vm.resolve("src/Main.java")),Files.readAllBytes(mirror.resolve("src/Main.java"))),"HOST changes applied preserving exact CRLF");
         check(!Files.exists(vm.resolve("delete.txt"))&&Files.exists(vm.resolve("new/中文.java")),"add/delete applied");
         check(Arrays.equals(indexBefore,Files.readAllBytes(vm.resolve(".git/index")))&&headBefore.equals(GitReader.head(vm,"git")),"VM index and HEAD unchanged");
@@ -225,7 +228,7 @@ public final class CoreTest {
         engine.apply(engine.preview("ri-core",first));
         check(Files.readString(outside.resolve("src/Main.java")).equals("baseline\r\n"),"snapshot creates and applies to external directory");
         check(!Files.exists(workspace.resolve("projects")),"no forced projects directory created");
-        git(outside,"init","-q");git(outside,"config","user.name","Test");git(outside,"config","user.email","test@example.invalid");git(outside,"add","src/Main.java");git(outside,"commit","-qm","local baseline");
+        git(outside,"init","-q");git(outside,"config","user.name","Test");git(outside,"config","user.email","test@example.invalid");git(outside,"config","core.autocrlf","false");git(outside,"config","core.safecrlf","false");git(outside,"add","src/Main.java");git(outside,"commit","-qm","local baseline");
         write(outside,"src/Main.java",bytes("new edit\r\n"));Payload work=engine.generate("ri-core").payload();
         check(work.entries().size()==1&&work.entries().getFirst().path().equals("src/Main.java")&&work.type()==Type.WORKTREE,"external directory produces project-relative WORKTREE");
         write(outside,"extra.txt",bytes("delete on snapshot"));write(outside,"target/keep",bytes("excluded"));write(outside,".git/keep-marker",bytes("local git metadata"));

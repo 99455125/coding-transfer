@@ -36,7 +36,7 @@ final class ProjectInbox {
         // Revalidate every persisted block at completion, including after a restart.
         StringBuilder joined = new StringBuilder();
         for (var entry : parts.entrySet()) {
-            Part saved = parse(new String(SafeFiles.read(entry.getValue(), 4*1024*1024+4096), StandardCharsets.UTF_8));
+            Part saved = parse(new String(SafeFiles.read(entry.getValue(), TransferLimits.MAX_PACKET_CHARS), StandardCharsets.UTF_8));
             require(saved.signature().equals(part.signature()) && saved.count()==part.count()
                     && saved.index()==entry.getKey(), "持久化会话不一致");
             joined.append(saved.data());
@@ -69,7 +69,7 @@ final class ProjectInbox {
     private static void savePart(Path dir, Part part, String text) throws IOException {
         Path file=dir.resolve(part.index()+".txt");byte[] current=text.getBytes(StandardCharsets.UTF_8);
         if(Files.exists(file)){
-            Part existing=parse(new String(SafeFiles.read(file,4*1024*1024+4096),StandardCharsets.UTF_8));
+            Part existing=parse(new String(SafeFiles.read(file,TransferLimits.MAX_PACKET_CHARS),StandardCharsets.UTF_8));
             require(existing.signature().equals(part.signature()) && existing.count()==part.count() && existing.data().equals(part.data()),"重复块内容不一致");
         }else SafeFiles.atomicWrite(file,current);
     }

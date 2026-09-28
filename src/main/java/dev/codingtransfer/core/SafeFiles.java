@@ -15,7 +15,7 @@ public final class SafeFiles {
         Path dir=state(workspace).resolve(kind).resolve(session);noLinks(dir);if(!Files.exists(dir))return;
         String name=kind.equals("file-outgoing")?"content.bin":"history.bundle";
         List<Path> files;try(var stream=Files.list(dir)){files=stream.toList();}
-        for(Path file:files){noLinks(file);require(file.getFileName().toString().equals(name)&&Files.isRegularFile(file),"发送会话含未知文件，拒绝清理");}
+        for(Path file:files){noLinks(file);String actual=file.getFileName().toString();require((actual.equals(name)||(kind.equals("file-outgoing")&&actual.equals("metadata.txt")))&&Files.isRegularFile(file),"发送会话含未知文件，拒绝清理");}
         for(Path file:files)Files.delete(file);Files.delete(dir);
     }
     public static void validateNames(Collection<String> names) throws IOException {
@@ -112,7 +112,7 @@ public final class SafeFiles {
         Path ignore=p.resolve(".gitignore");noLinks(ignore);
         String rules=Files.exists(ignore)?new String(read(ignore,64*1024),java.nio.charset.StandardCharsets.UTF_8):"";
         String updated=rules;
-        for(String rule:List.of("baselines/","inbox/","file-inbox/","file-outgoing/","backups/","locks/","bundle-state/","git-staging/","git-outgoing/","merge-staging/","disabled-hooks/","*.tmp"))
+        for(String rule:List.of("baselines/","inbox/","file-inbox/","file-outgoing/","transfer-sessions/","transfer-completions/","backups/","locks/","bundle-state/","git-staging/","git-outgoing/","merge-staging/","disabled-hooks/","*.tmp"))
             if(!Arrays.asList(updated.split("\n")).contains(rule))updated+=(updated.isEmpty()||updated.endsWith("\n")?"":"\n")+rule+"\n";
         if(!updated.equals(rules))atomicWrite(ignore,updated.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         return p;

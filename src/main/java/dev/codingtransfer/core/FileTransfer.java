@@ -33,12 +33,51 @@ public final class FileTransfer {
     }
     public static Outgoing generate(Path file,int chunkKb)throws IOException{return generate(file,chunkKb,file.toAbsolutePath().getParent());}
     public static Outgoing generate(Path file,int chunkKb,Path workspace)throws IOException{
-        require(chunkKb>=4&&chunkKb<=4096,"分块大小范围 4–4096 KiB");filename(file.getFileName().toString());
+        require(chunkKb>=4&&chunkKb<=TransferLimits.MAX_CHUNK_KB,"分块大小范围 4–1048576 KiB");filename(file.getFileName().toString());
         SafeFiles.noLinks(file);require(Files.isRegularFile(file),"不是普通文件: "+file);
         String session=UUID.randomUUID().toString();Path snapshot=SafeFiles.state(workspace).resolve("file-outgoing").resolve(session).resolve("content.bin");
         SafeFiles.noLinks(snapshot);Files.createDirectories(snapshot.getParent());String digest=copyHash(file,snapshot);long size=Files.size(snapshot);int width=chunkKb*1024/4*3;
         int count=Math.toIntExact(Math.max(1,size/width+(size%width==0?0:1)));
-        return new Outgoing(new Metadata(session,file.getFileName().toString(),size,width,count,digest),snapshot);
+        Metadata metadata=new Metadata(session,file.getFileName().toString(),size,width,count,digest);
+        SafeFiles.atomicWrite(snapshot.getParent().resolve("metadata.txt"),metadata.header().getBytes(StandardCharsets.UTF_8));
+        return new Outgoing(metadata,snapshot);
+    }
+    public static Outgoing loadOutgoing(Path workspace,String session)throws IOException{
+        require(session!=null&&session.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),"无效文件会话");
+        Path dir=SafeFiles.state(workspace).resolve("file-outgoing").resolve(session);SafeFiles.noLinks(dir);Path metadataFile=dir.resolve("metadata.txt"),snapshot=dir.resolve("content.bin");SafeFiles.noLinks(metadataFile);SafeFiles.noLinks(snapshot);
+        String[] lines=new String(SafeFiles.read(metadataFile,4096),StandardCharsets.UTF_8).split("\\n",-1);
+        if(lines.length!=9||!lines[8].isEmpty()||!lines[0].equals("VMSYNC-FILE/1"))throw new IOException("文件发送快照元数据损坏");
+        try{Map<String,String> f=new HashMap<>();for(int i=1;i<8;i++){int at=lines[i].indexOf(':');if(at<1||f.putIfAbsent(lines[i].substring(0,at),lines[i].substring(at+1))!=null)throw new IOException("文件发送快照元数据无效");}
+            if(!f.keySet().equals(Set.of("SESSION","FILENAME","SIZE","CHUNK-BYTES","PARTS","ENCODING","SHA256"))||!f.get("SESSION").equals(session)||!f.get("ENCODING").equals("BASE64"))throw new IOException("文件发送快照元数据不匹配");
+            filename(f.get("FILENAME"));long size=number(f.get("SIZE"),Long.MAX_VALUE);int width=(int)number(f.get("CHUNK-BYTES"),TransferLimits.MAX_FILE_CHUNK_BYTES),count=(int)number(f.get("PARTS"),Integer.MAX_VALUE);
+            if(width<3072||width%3!=0||count!=Math.max(1,size/width+(size%width==0?0:1))||!hashValue(f.get("SHA256"))||!Files.isRegularFile(snapshot)||Files.size(snapshot)!=size||!copyHash(snapshot,null).equals(f.get("SHA256")))throw new IOException("文件发送快照校验失败");
+            return new Outgoing(new Metadata(session,f.get("FILENAME"),size,width,count,f.get("SHA256")),snapshot);
+        }catch(NumberFormatException e){throw new IOException("文件发送快照元数据无效",e);}
+    }
+    public static Received resume(Path workspace,String session)throws IOException{
+        Path dir=SafeFiles.state(workspace).resolve("file-inbox").resolve(session);SafeFiles.noLinks(dir);Path meta=dir.resolve("metadata.txt");SafeFiles.noLinks(meta);
+        String header=new String(SafeFiles.read(meta,4096),StandardCharsets.UTF_8);Path piece=null;
+        try(var files=Files.list(dir)){for(Path f:files.toList())if(f.getFileName().toString().matches("[1-9][0-9]{0,9}\\.part")){piece=f;break;}}
+        if(piece==null)throw new IOException("文件收件会话没有已保存分块");String number=piece.getFileName().toString().replace(".part","");byte[] data=SafeFiles.read(piece,TransferLimits.MAX_FILE_CHUNK_BYTES);
+        return receive(workspace,header+"PART:"+number+"\nCHUNK256:"+hash(data)+"\nDATA:\n"+Base64.getEncoder().encodeToString(data));
+    }
+    /** Restores the newest verified receiver cache without relying on the transport session still being active. */
+    public static Received latestVerified(Path workspace)throws IOException{
+        Path latest=null;long modified=Long.MIN_VALUE;
+        try(var sessions=Files.list(inbox(workspace))){
+            for(Path dir:sessions.toList()){
+                SafeFiles.noLinks(dir);
+                require(Files.isDirectory(dir)&&dir.getFileName().toString().matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),"文件收件箱含未知会话");
+                Path verified=dir.resolve("verified.bin");SafeFiles.noLinks(verified);
+                if(!Files.isRegularFile(verified))continue;
+                long time=Files.getLastModifiedTime(verified).toMillis();
+                if(latest==null||time>modified){latest=dir;modified=time;}
+            }
+        }
+        if(latest==null)return null;
+        Received received=resume(workspace,latest.getFileName().toString());
+        require(received.complete(),"文件收件缓存尚未完整");
+        return received;
     }
     private static long number(String s,long max)throws IOException{
         require(s!=null&&s.matches("0|[1-9][0-9]{0,18}"),"无效数字字段");
@@ -55,7 +94,7 @@ public final class FileTransfer {
         }catch(java.security.NoSuchAlgorithmException e){throw new AssertionError(e);}
     }
     private static Part parse(String text)throws IOException{
-        require(text!=null&&text.length()<=4*1024*1024+4096,"分块为空或超过限制");text=text.replace("\r\n","\n");
+        require(text!=null&&text.length()<=TransferLimits.MAX_PACKET_CHARS,"分块为空或超过限制");text=text.replace("\r\n","\n");
         // Preserve empty-file DATA and do not trim filename/header content.
         int at=text.indexOf("\nDATA:\n");require(at>0&&at<3072,"不是文件传输分块，请选择正确页面");
         String[] lines=text.substring(0,at).split("\n",-1);require(lines[0].equals("VMSYNC-FILE/1"),"不是文件传输协议");
@@ -66,9 +105,9 @@ public final class FileTransfer {
         String session=fields.get("SESSION"),name=fields.get("FILENAME");filename(name);
         require(session.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),"无效文件会话");
         require(fields.get("ENCODING").equals("BASE64")&&hashValue(fields.get("SHA256"))&&hashValue(fields.get("CHUNK256")),"无效编码/校验值");
-        long size=number(fields.get("SIZE"),Long.MAX_VALUE);int width=(int)number(fields.get("CHUNK-BYTES"),3*1024*1024),count=(int)number(fields.get("PARTS"),Integer.MAX_VALUE),part=(int)number(fields.get("PART"),Integer.MAX_VALUE);
+        long size=number(fields.get("SIZE"),Long.MAX_VALUE);int width=(int)number(fields.get("CHUNK-BYTES"),TransferLimits.MAX_FILE_CHUNK_BYTES),count=(int)number(fields.get("PARTS"),Integer.MAX_VALUE),part=(int)number(fields.get("PART"),Integer.MAX_VALUE);
         require(width>=3072&&width%3==0&&count==Math.max(1,size/width+(size%width==0?0:1))&&part>=1&&part<=count,"无效分块数量/大小");
-        String encoded=text.substring(at+7).strip();require(encoded.length()<=4*1024*1024&&encoded.matches("[A-Za-z0-9+/]*={0,2}"),"无效文件 Base64");
+        String encoded=text.substring(at+7).strip();require(encoded.length()<=TransferLimits.MAX_DATA_CHARS&&encoded.matches("[A-Za-z0-9+/]*={0,2}"),"无效文件 Base64");
         byte[] bytes;try{bytes=Base64.getDecoder().decode(encoded);}catch(IllegalArgumentException e){throw new IOException("无效文件 Base64",e);}
         require(bytes.length==Math.min(width,size-(part-1L)*width),"分块长度与头部不一致");
         require(hash(bytes).equals(fields.get("CHUNK256")),"CHECKSUM_ERROR: 文件分块损坏，请重新复制");
@@ -77,14 +116,20 @@ public final class FileTransfer {
     private static Path inbox(Path workspace)throws IOException{
         Path p=SafeFiles.state(workspace).resolve("file-inbox");SafeFiles.noLinks(p);Files.createDirectories(p);return p;
     }
-    public static Received receive(Path workspace,String text)throws IOException{
-        Part part=parse(text);Metadata m=part.metadata;Path inbox=inbox(workspace),dir=inbox.resolve(m.session);SafeFiles.noLinks(dir);
+    public static Received receive(Path workspace,String text)throws IOException{return receivePart(workspace,parse(text));}
+    public static Received receive(Path workspace,String text,String expectedSession,int expectedIndex,int expectedTotal)throws IOException{
+        Part part=parse(text);
+        require(part.metadata.session().equals(expectedSession)&&part.number==expectedIndex&&part.metadata.count()==expectedTotal,"文件块内外层会话/序号/总数不一致");
+        return receivePart(workspace,part);
+    }
+    private static Received receivePart(Path workspace,Part part)throws IOException{
+        Metadata m=part.metadata;Path inbox=inbox(workspace),dir=inbox.resolve(m.session);SafeFiles.noLinks(dir);
         try(var paths=Files.list(inbox)){require(Files.exists(dir)||paths.count()<32,"文件收件箱达到 32 会话，请先清理旧会话");}
         Files.createDirectories(dir);
         Path meta=dir.resolve("metadata.txt");byte[] header=m.header().getBytes(StandardCharsets.UTF_8);
         if(Files.exists(meta))require(Arrays.equals(SafeFiles.read(meta,4096),header),"混合文件会话：名称/大小/校验值不一致");else SafeFiles.atomicWrite(meta,header);
         Path chunk=dir.resolve(part.number+".part");
-        if(Files.exists(chunk))require(Arrays.equals(SafeFiles.read(chunk,3*1024*1024),part.bytes),"重复分块内容不一致");else SafeFiles.atomicWrite(chunk,part.bytes);
+        if(Files.exists(chunk))require(Arrays.equals(SafeFiles.read(chunk,TransferLimits.MAX_FILE_CHUNK_BYTES),part.bytes),"重复分块内容不一致");else SafeFiles.atomicWrite(chunk,part.bytes);
         SortedSet<Integer> present=new TreeSet<>();
         try(var paths=Files.list(dir)){for(Path p:paths.toList())if(p.getFileName().toString().matches("[1-9][0-9]{0,9}\\.part")){
             SafeFiles.noLinks(p);String name=p.getFileName().toString();int index=(int)number(name.substring(0,name.length()-5),m.count);require(Files.isRegularFile(p),"分块不是文件");present.add(index);

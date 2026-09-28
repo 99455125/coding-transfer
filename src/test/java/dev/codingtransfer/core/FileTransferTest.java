@@ -14,13 +14,14 @@ final class FileTransferTest {
         Path sender=Files.createDirectory(temp.resolve("file-sender")),receiver=Files.createDirectory(temp.resolve("file-receiver"));
         Path file=sender.resolve("中文 plugin 二进制.jar");byte[] data=new byte[24000];new Random(93).nextBytes(data);Files.write(file,data);
         FileTransfer.Outgoing sent=FileTransfer.generate(file,4);check(sent.chunks().size()>1,"single binary file chunked");
+        FileTransfer.Outgoing reloaded=FileTransfer.loadOutgoing(sender,sent.metadata().session());check(reloaded.metadata().equals(sent.metadata())&&reloaded.chunks().getFirst().equals(sent.chunks().getFirst()),"sender snapshot and metadata survive restart");
         check(sent.chunks().getFirst().contains("FILENAME:中文 plugin 二进制.jar\n"),"filename carried in every header");
         check(!sent.chunks().getFirst().contains(sender.toString()),"sender directory never transmitted");
         check(sent.metadata().size()==data.length&&sent.metadata().sha256().equals(hash(data)),"raw file size and SHA-256");
-        FileTransfer.Received received=FileTransfer.receive(receiver,sent.chunks().getLast());check(!received.complete()&&received.received()==1&&received.firstMissing()==1,"out of order block persisted");
+        FileTransfer.Received received=FileTransfer.receive(receiver,sent.chunks().getLast());check(!received.complete()&&received.received()==1&&received.firstMissing()==1,"out of order block persisted");FileTransfer.Received resumed=FileTransfer.resume(receiver,sent.metadata().session());check(resumed.received()==1&&resumed.firstMissing()==1,"receiver inbox progress reloads after restart");
         received=FileTransfer.receive(receiver,sent.chunks().getLast().replace("\n","\r\n"));check(received.received()==1,"duplicate CRLF block idempotent");
         FileTransfer.Received partial=received;fails("partial cannot be saved",()->FileTransfer.save(partial,FileTransfer.destination(receiver.resolve("partial.bin"))));
-        for(String block:sent.chunks())received=FileTransfer.receive(receiver,block);
+        for(String block:sent.chunks())received=FileTransfer.receive(receiver,block);check(FileTransfer.resume(receiver,sent.metadata().session()).complete(),"complete verified receiver file reloads after restart");
         check(received.complete()&&received.firstMissing()==0&&Arrays.equals(Files.readAllBytes(received.verifiedFile()),data),"binary round trip including non-UTF8 bytes");
         check(!Files.exists(receiver.resolve(sent.metadata().filename())),"completion never writes a default target automatically");
         Path target=receiver.resolve("用户指定的新名字.bin");FileTransfer.save(received,FileTransfer.destination(target));check(Arrays.equals(Files.readAllBytes(target),data),"receiver chooses directory and different filename");
@@ -51,7 +52,7 @@ final class FileTransferTest {
         fails("clear traversal rejected",()->FileTransfer.clear(receiver,"../"));
         Path empty=sender.resolve("empty.bin");Files.write(empty,new byte[0]);FileTransfer.Outgoing zero=FileTransfer.generate(empty,4);check(zero.chunks().size()==1,"empty file has one block");
         FileTransfer.Received emptyResult=FileTransfer.receive(receiver,zero.chunks().getFirst());FileTransfer.save(emptyResult,FileTransfer.destination(receiver.resolve("empty-output")));check(Files.size(receiver.resolve("empty-output"))==0,"empty file saved exactly");
-        fails("directory source rejected",()->FileTransfer.generate(sender,4));fails("chunk lower limit",()->FileTransfer.generate(file,1));fails("chunk upper limit",()->FileTransfer.generate(file,4097));
+        fails("directory source rejected",()->FileTransfer.generate(sender,4));fails("chunk lower limit",()->FileTransfer.generate(file,1));fails("chunk upper limit",()->FileTransfer.generate(file,TransferLimits.MAX_CHUNK_KB+1));
         check(Files.readString(receiver.resolve(".vmsync/.gitignore")).contains("file-inbox/"),"file inbox ignored by outer Git");
         check(!Files.exists(receiver.resolve(".vmsync/config.yaml")),"no role or project configuration required");
         System.out.println("PASS ALL "+checks+" File checks");

@@ -8,14 +8,16 @@ import java.util.regex.Pattern;
 import static dev.codingtransfer.core.Model.*;
 
 /** Intentionally small, fail-closed YAML subset, matching the documented configuration. */
-public record Config(Role role, List<Mapping> projects, List<String> exclude, int chunkKb, String git) {
+public record Config(Role role, List<Mapping> projects, List<String> exclude, int chunkKb, String git, String identity) {
     public record Mapping(String id, String local, String vm) {
         @Override public String toString() { return id; }
     }
-    public Config { projects = List.copyOf(projects); exclude = List.copyOf(exclude); }
+    public Config(Role role,List<Mapping> projects,List<String> exclude,int chunkKb,String git){this(role,projects,exclude,chunkKb,git,"");}
+    public Config { projects = List.copyOf(projects); exclude = List.copyOf(exclude); identity=identity==null?"":identity; }
     public static final String TEMPLATE = """
             # 两端项目 id 和 exclude 保持一致；path 只填写本端路径。
             role: HOST
+            identity: ''
             git: git
             projects:
               - id: ri-core
@@ -31,7 +33,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
             """;
     public static Config parse(String text) throws IOException {
         require(text.length() <= 64 * 1024, "配置过大");
-        String role = null, git = "git", section = ""; int chunk = 128;
+        String role = null, git = "git", identity = "", section = ""; int chunk = 128;
         List<Mapping> mappings = new ArrayList<>(); List<String> exclude = new ArrayList<>();
         Map<String,String> mapping = null; Set<String> top = new HashSet<>(); boolean chunkSeen = false;
         for (String raw : text.split("\\R")) {
@@ -45,6 +47,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
                 section = key;
                 switch (key) {
                     case "role" -> role = value;
+                    case "identity" -> identity = value;
                     case "git" -> git = value;
                     case "projects", "exclude", "clipboard" -> require(value.isEmpty(), "列表必须分行: " + key);
                     default -> throw new IOException("不支持的配置项: " + key);
@@ -80,8 +83,9 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
         }
         if (mapping != null) mappings.add(mapping(mapping));
         require("HOST".equals(role) || "VM".equals(role), "role 必须是 HOST 或 VM");
+        require(identity.isEmpty() || identity.matches("[A-Za-z0-9_-]{1,128}"), "identity 格式无效");
         require(!mappings.isEmpty() && mappings.size() <= 100, "请配置 1–100 个项目");
-        require(chunk >= 4 && chunk <= 4096, "chunk-size-kb 范围为 4–4096");
+        require(chunk >= 4 && chunk <= TransferLimits.MAX_CHUNK_KB, "chunk-size-kb 范围为 4–1048576");
         require(!git.isBlank() && !git.contains("\n"), "Git 可执行文件不能为空");
         List<Mapping> active=new ArrayList<>();
         for(Mapping m:mappings){
@@ -99,7 +103,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
         List<String> vmPaths = new ArrayList<>(vms);
         for (String a : vmPaths) for (String b : vmPaths)
             require(a.equals(b) || !a.startsWith(b + "/"), "VM 项目路径不能嵌套");
-        return new Config(Role.valueOf(role), mappings, exclude.stream().distinct().sorted().toList(), chunk, git);
+        return new Config(Role.valueOf(role), mappings, exclude.stream().distinct().sorted().toList(), chunk, git, identity);
     }
     private static String scalar(String s) throws IOException {
         s = s.strip();
@@ -131,7 +135,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
     }
     public String policy() { return hash(("v2-hard-excludes:.git,.vmsync,.gitattributes\n" + String.join("\n", exclude)).getBytes(StandardCharsets.UTF_8)); }
     public String yaml() {
-        StringBuilder out = new StringBuilder("role: " + role + "\ngit: '" + git + "'\nprojects:\n");
+        StringBuilder out = new StringBuilder("role: " + role + "\nidentity: '" + identity + "'\ngit: '" + git + "'\nprojects:\n");
         for (Mapping m : projects) out.append("  - id: ").append(m.id()).append("\n    path: '").append(role==Role.HOST?m.local():m.vm()).append("'\n");
         out.append("exclude:\n"); for (String p : exclude) out.append("  - '").append(p).append("'\n");
         return out.append("clipboard:\n  chunk-size-kb: ").append(chunkKb).append('\n').toString();

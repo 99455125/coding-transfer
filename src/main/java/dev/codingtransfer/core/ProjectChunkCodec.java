@@ -17,7 +17,7 @@ final class ProjectChunkCodec {
         }
     }
     public static List<String> split(Payload payload, int chunkKb) throws IOException {
-        require(chunkKb>=4 && chunkKb<=4096,"分块大小范围 4–4096 KiB");
+        require(chunkKb>=4 && chunkKb<=TransferLimits.MAX_CHUNK_KB,"分块大小范围 4–1048576 KiB");
         byte[] encoded=Codec.encode(payload);String data=Base64.getEncoder().encodeToString(encoded), checksum=hash(encoded),session=UUID.randomUUID().toString();
         int width=chunkKb*1024, count=(int)(((long)data.length()+width-1)/width);List<String> result=new ArrayList<>();
         boolean work=payload.type()==Type.WORKTREE,host=work||payload.type()==Type.ACK;
@@ -30,7 +30,7 @@ final class ProjectChunkCodec {
         return List.copyOf(result);
     }
     static Part parse(String text)throws IOException{
-        require(text!=null && text.length()<=4*1024*1024+4096,"剪贴板为空或分块过大");
+        require(text!=null && text.length()<=TransferLimits.MAX_PACKET_CHARS,"剪贴板为空或分块过大");
         text=text.strip().replace("\r\n","\n");int dataAt=text.indexOf("\nDATA:\n");
         require(dataAt>0 && dataAt<2048,"无效 VMSYNC 分块");String[] lines=text.substring(0,dataAt).split("\n");
         require(lines[0].matches("VMSYNC/[123]"),"不支持的剪贴板协议");int protocol=Integer.parseInt(lines[0].substring(7));Map<String,String> fields=new TreeMap<>();
@@ -48,7 +48,7 @@ final class ProjectChunkCodec {
         require(fields.get("PART").matches("[1-9][0-9]{0,8}/[1-9][0-9]{0,8}"),"无效分块序号");
         String[] part=fields.get("PART").split("/");int index=Integer.parseInt(part[0]),count=Integer.parseInt(part[1]);
         require(index<=count,"分块数量超限");String data=text.substring(dataAt+7);
-        require(!data.isEmpty() && data.length()<=4*1024*1024 && data.matches("[A-Za-z0-9+/]+={0,2}"),"无效 Base64 分块");
+        require(!data.isEmpty() && data.length()<=TransferLimits.MAX_DATA_CHARS && data.matches("[A-Za-z0-9+/]+={0,2}"),"无效 Base64 分块");
         require(hash(data.getBytes(StandardCharsets.US_ASCII)).equals(fields.get("CHUNK256")),"CHECKSUM_ERROR: 分块校验失败，请重新复制");
         return new Part(fields,index,count,data,protocol);
     }

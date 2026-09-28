@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.shie.tools.git-change-export</id>
     <name>Every Sync</name>
-    <version>4.3.5</version>
+    <version>5.0.0</version>
     <vendor>Coding Transfer</vendor>
     <description><![CDATA[
     Project-scoped clipboard synchronization. VM is the business source of truth.
@@ -14,6 +14,7 @@
     <idea-version since-build="251.26094.121" until-build="253.*"/>
     <depends>com.intellij.modules.platform</depends>
     <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="dev.codingtransfer.plugin.TransferCoordinator"/>
         <toolWindow id="Every Sync" anchor="right" factoryClass="dev.codingtransfer.plugin.SyncToolWindow" icon="AllIcons.Actions.Synchronize"/>
     </extensions>
     <actions>

@@ -42,7 +42,7 @@ public final class BuildPlugin {
                 JarEntry entry=new JarEntry(classes.relativize(file).toString().replace('\\','/'));entry.setTime(0);out.putNextEntry(entry);Files.copy(file,out);out.closeEntry();
             }
         }
-        Path zip=output.resolve("every-sync-4.3.5.zip");
+        Path zip=output.resolve("every-sync-5.0.0.zip");
         try(ZipOutputStream out=new ZipOutputStream(Files.newOutputStream(zip))){ZipEntry entry=new ZipEntry("coding-transfer/lib/coding-transfer.jar");entry.setTime(0);out.putNextEntry(entry);Files.copy(jar,out);out.closeEntry();}
         Path dist=Files.createDirectories(root.resolve("dist")).resolve(zip.getFileName());Files.copy(zip,dist,StandardCopyOption.REPLACE_EXISTING);
         String sha=HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(dist)));
