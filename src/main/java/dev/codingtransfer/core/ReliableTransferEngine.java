@@ -21,7 +21,7 @@ public final class ReliableTransferEngine {
 
     public enum Kind { PROJECT, FILE }
     public enum Direction { HOST_TO_VM, VM_TO_HOST, FILE }
-    public enum Type { INVITE, READY, DATA, BLOCK_ACK, MISSING, RECEIVED, BUSINESS_ACK, FINAL, FINAL_ACK, CANCEL, ERROR }
+    public enum Type { INVITE, READY, DATA, BLOCK_ACK, MISSING, RECEIVED, BUSINESS_ACK, FINAL, FINAL_ACK, CANCEL, ERROR, REQUEST }
     public enum AckDisposition { ADVANCED, DUPLICATE }
     public record AckResult(AckDisposition disposition,int acknowledgedIndex,int nextIndex) {}
     public enum InviteDisposition { ACCEPTED, DUPLICATE_READY, ALREADY_ADVANCED }
@@ -39,7 +39,7 @@ public final class ReliableTransferEngine {
                     || transferId == null || !transferId.matches("[A-Za-z0-9_.:-]{1,128}")
                     || kind == null || direction == null || type == null || total < 1 || total > 1_000_000)
                 throw new IllegalArgumentException("传输消息字段无效");
-            if ((type == Type.DATA || type == Type.BLOCK_ACK || type == Type.MISSING) ? index < 1 || index > total : index != 0)
+            if ((type == Type.DATA || type == Type.BLOCK_ACK || type == Type.MISSING || type == Type.REQUEST) ? index < 1 || index > total : index != 0)
                 throw new IllegalArgumentException("传输块序号无效");
             if (payload == null || payload.length > TransferLimits.MAX_PACKET_CHARS)
                 throw new IllegalArgumentException("传输消息数据为空或过大");
@@ -148,6 +148,121 @@ public final class ReliableTransferEngine {
                 Type.READY, 0, invite.total(), new byte[0])));
     }
 
+    /** Pull-mode receiver: the durable current request owns all block retries. */
+    public InviteResult acceptPullInviteResult(String frame)throws IOException {
+        Message invite=decode(identity,key,frame);
+        if(invite.type()!=Type.INVITE)throw new RejectedFrame("接收需要先收到发送端邀请");
+        TransferSessionStore.Context context=store.currentContext();
+        if(context!=null)requireContext(invite);
+        else {
+            store.saveContext(new TransferSessionStore.Context(invite.session(),invite.scopeId(),invite.transferId(),invite.kind(),invite.direction(),invite.total()));
+            store.saveState(invite.session(),state(1));
+        }
+        if(store.hasFrame(invite.session())) {
+            Message pending=decode(identity,key,store.readFrame(invite.session()));
+            if(!sameTransfer(pending,invite))throw new RejectedFrame("邀请与待处理帧不匹配");
+            if(pending.type()!=Type.REQUEST&&pending.type()!=Type.READY&&pending.type()!=Type.BLOCK_ACK)
+                return new InviteResult(InviteDisposition.ALREADY_ADVANCED,null);
+        }
+        int next=nextIndex(invite.session());
+        if(next>invite.total())return new InviteResult(InviteDisposition.ALREADY_ADVANCED,null);
+        return new InviteResult(context==null?InviteDisposition.ACCEPTED:InviteDisposition.DUPLICATE_READY,saveRequest(invite,next));
+    }
+
+    /** REQUEST(n) acknowledges only the previously prepared contiguous prefix and asks for n. */
+    public int acceptRequest(String frame)throws IOException {
+        Message request=decode(identity,key,frame);
+        if(request.type()!=Type.REQUEST)throw new RejectedFrame("收到的不是数据请求");
+        requireContext(request);
+        int cursor=nextIndex(request.session());
+        Message pending=store.hasFrame(request.session())?decode(identity,key,store.readFrame(request.session())):null;
+        if(request.index()<cursor) {
+            // Legacy final BLOCK_ACK (or a crash before FINAL creation) may leave no pending DATA.
+            // Only an explicit request for the last block may reopen this receipt-wait state.
+            if(pending==null&&cursor==request.total()+1&&request.index()==request.total()) {
+                if(request.kind()==Kind.FILE) {
+                    FileProgress progress=fileProgress(request);
+                    if(progress.prepared.nextClearBit(1)<=request.total())throw new RejectedFrame("末块恢复包含从未发送的文件块");
+                    progress.confirmed.clear(request.total());saveFileProgress(request.session(),progress);
+                }else store.saveState(request.session(),state(request.total()));
+                return request.index();
+            }
+            throw new RejectedFrame("忽略已过期的数据请求");
+        }
+        if(pending!=null&&!sameTransfer(pending,request))throw new RejectedFrame("请求与待发送帧不匹配");
+        if(pending!=null&&pending.type()==Type.INVITE) {
+            if(request.index()!=1||cursor!=1)throw new RejectedFrame("首次请求必须从第 1 块开始");
+            store.saveState(request.session(),state(1));store.clearFrame(request.session());return 1;
+        }
+        if(pending!=null&&pending.type()!=Type.DATA)throw new RejectedFrame("当前状态不接受数据请求");
+        if(pending!=null&&request.index()==pending.index())return request.index();
+        if(pending==null) {
+            if(request.index()!=cursor)throw new RejectedFrame("请求不能跳过未发送的数据块");
+            return cursor;
+        }
+        if(request.kind()==Kind.FILE) {
+            FileProgress progress=fileProgress(request);
+            if(progress.prepared.nextClearBit(1)<request.index())throw new RejectedFrame("请求确认了从未发送的文件块");
+            progress.confirmed.set(1,request.index());saveFileProgress(request.session(),progress);
+        }else {
+            if(request.index()!=pending.index()+1||request.index()>cursor+1)
+                throw new RejectedFrame("请求不能跳过未发送的数据块");
+            store.saveState(request.session(),state(request.index()));
+        }
+        store.clearFrame(request.session());return request.index();
+    }
+
+    /** Persist first, then request the smallest missing block; stale DATA cannot rewind that request. */
+    public String acceptRequestedData(String frame,BlockSink sink)throws IOException {
+        Message data=decode(identity,key,frame);
+        if(data.type()!=Type.DATA)throw new RejectedFrame("需要数据块消息");
+        requireContext(data);
+        Message pending=store.hasFrame(data.session())?decode(identity,key,store.readFrame(data.session())):null;
+        if(pending!=null&&(!sameTransfer(pending,data)||!java.util.Set.of(Type.REQUEST,Type.READY,Type.BLOCK_ACK).contains(pending.type())))
+            throw new RejectedFrame("接收端仍有未确认控制消息");
+        int next=nextIndex(data.session());
+        if(data.index()>next)throw new RejectedFrame("数据块不是接收端当前请求的块");
+        sink.persist(data); // Inner inbox validates duplicate bytes; failure emits no request/ACK.
+        if(data.kind()==Kind.FILE) {
+            FileProgress progress=fileProgress(data);progress.confirmed.set(data.index());saveFileProgress(data.session(),progress);
+            next=progress.confirmed.nextClearBit(1);
+        }else if(data.index()==next) {next++;store.saveState(data.session(),state(next));}
+        if(next<=data.total())return saveRequest(data,next);
+        Message ack=new Message(data.session(),data.scopeId(),data.transferId(),data.kind(),data.direction(),Type.BLOCK_ACK,data.total(),data.total(),new byte[0]);
+        return saveControl(ack);
+    }
+
+    /** Recover receiver control from durable coverage if interrupted between state and frame writes. */
+    public String resumePullReceiver()throws IOException {
+        var context=store.currentContext();if(context==null)return null;
+        if(store.hasFrame(context.session())) {
+            String frame=store.readFrame(context.session());Message pending=decode(identity,key,frame);
+            requireContext(pending);
+            if(!java.util.Set.of(Type.REQUEST,Type.READY,Type.BLOCK_ACK).contains(pending.type()))return frame;
+        }
+        int next=nextIndex(context.session());
+        Message control=new Message(context.session(),context.scopeId(),context.transferId(),context.kind(),context.direction(),
+                Type.REQUEST,next<=context.total()?next:context.total(),context.total(),new byte[0]);
+        return saveControl(control);
+    }
+
+    private String saveRequest(Message transfer,int index)throws IOException {
+        return saveControl(new Message(transfer.session(),transfer.scopeId(),transfer.transferId(),transfer.kind(),transfer.direction(),Type.REQUEST,index,transfer.total(),new byte[0]));
+    }
+    private String saveControl(Message message)throws IOException {
+        if(store.hasFrame(message.session())) {
+            String previous=store.readFrame(message.session());if(decode(identity,key,previous).equals(message))return previous;
+        }
+        String frame=encode(identity,key,message);store.clearFrame(message.session());store.saveFrame(message.session(),frame);return frame;
+    }
+    private void requireContext(Message message)throws IOException {
+        TransferSessionStore.Context context=store.currentContext();
+        if(context==null||!context.session().equals(message.session())||!context.scopeId().equals(message.scopeId())
+                ||!context.transferId().equals(message.transferId())||context.kind()!=message.kind()
+                ||context.direction()!=message.direction()||context.total()!=message.total())
+            throw new RejectedFrame("消息与已接受传输会话不匹配");
+    }
+
     /** Sender advances from INVITE to data only after a matching READY. */
     public void acceptReady(String frame, String session) throws IOException {
         acceptReadyResult(frame,session);
@@ -246,6 +361,7 @@ public final class ReliableTransferEngine {
         boolean finalDataPending = false;
         if (store.hasFrame(session)) {
             Message pending = decode(identity, key, store.readFrame(session));
+            if(pending.type()==Type.FINAL&&sameTransfer(pending,received))return;
             if (pending.type() == Type.DATA && pending.index() == pending.total() && sameTransfer(pending, received)) {
                 finalDataPending = true;
                 store.saveState(session, state(received.total() + 1));
@@ -265,12 +381,13 @@ public final class ReliableTransferEngine {
         if(ack.kind()==Kind.FILE){
             FileProgress progress=fileProgress(ack);
             if(progress.prepared.nextClearBit(1)<=ack.total())throw new IOException("仍有从未发送的文件块");
-            if(store.hasFrame(session)){Message pending=decode(identity,key,store.readFrame(session));if(pending.type()!=Type.DATA||!sameTransfer(pending,ack))throw new IOException("业务回执与待发送状态不匹配");}
+            if(store.hasFrame(session)){Message pending=decode(identity,key,store.readFrame(session));if((pending.type()!=Type.DATA&&pending.type()!=Type.FINAL)||!sameTransfer(pending,ack))throw new IOException("业务回执与待发送状态不匹配");}
             return;
         }
         int cursor = nextIndex(session);
         if (store.hasFrame(session)) {
             Message pending = decode(identity, key, store.readFrame(session));
+            if(pending.type()==Type.FINAL&&sameTransfer(pending,ack))return;
             if (pending.type() != Type.DATA || pending.index() != pending.total() || !sameTransfer(pending, ack)
                     || cursor != ack.total())
                 throw new IOException("业务回执与待发送状态不匹配");
@@ -283,6 +400,7 @@ public final class ReliableTransferEngine {
     public void acceptBusinessAck(String frame, String session, String scopeId, String transferId) throws IOException {
         validateBusinessAck(frame, session, scopeId, transferId);
         Message accepted=decode(identity,key,frame);
+        if(store.hasFrame(session)&&decode(identity,key,store.readFrame(session)).type()==Type.FINAL)return;
         if(accepted.kind()==Kind.FILE){
             FileProgress progress=fileProgress(accepted);progress.confirmed.set(1,accepted.total()+1);saveFileProgress(session,progress);store.clearFrame(session);return;
         }

@@ -21,6 +21,46 @@ public final class BundleSync {
         boolean waiting=accepted.git()==null||!sent.project().equals(accepted.project())||!sent.git().snapshot().equals(accepted.git().snapshot());if(!waiting)new PendingBundleTransferStore(workspace).clear(id,inFlight.session());return waiting;
     }
     public void markAutomaticTransferStarted(String projectId,String session,String transferId,int total)throws IOException{require(config.role()==Role.VM,"仅 VM Bundle 需要发送确认标记");Payload pending=Codec.decode(SafeFiles.read(state("pending",projectId)));require(pending.git()!=null&&pending.git().snapshot().equals(transferId),"待确认 Bundle 与自动传输不匹配");new PendingBundleTransferStore(workspace).mark(new PendingBundleTransferStore.Transfer(projectId,session,transferId,total));}
+    private Path endedRoot()throws IOException{Path root=SafeFiles.state(workspace).resolve("bundle-state/ended");SafeFiles.noLinks(root);return root;}
+    private String baselineHash(String id)throws IOException{Path ack=state("acknowledged",id);return Files.exists(ack)?hash(SafeFiles.read(ack)):"-";}
+    private List<PendingBundleTransferStore.Transfer> endedTransfers(String id)throws IOException{
+        projectId(id);Path root=endedRoot();if(!Files.exists(root))return List.of();List<PendingBundleTransferStore.Transfer> result=new ArrayList<>();
+        try(var dirs=Files.list(root)){for(Path dir:dirs.toList()){SafeFiles.noLinks(dir);require(Files.isDirectory(dir),"恢复目录包含无效文件");var marker=PendingBundleTransferStore.archived(workspace,dir.getFileName().toString()).read();if(marker!=null&&marker.projectId().equals(id))result.add(marker);}}
+        result.sort(Comparator.comparingLong((PendingBundleTransferStore.Transfer t)->{try{return Files.getLastModifiedTime(root.resolve(t.session()).resolve("current.context")).toMillis();}catch(IOException e){throw new java.io.UncheckedIOException(e);}}).reversed());return result;
+    }
+    public boolean hasEndedTransfer(String id)throws IOException{return !endedTransfers(id).isEmpty();}
+    public boolean needsEndedRestore(String id)throws IOException{
+        var context=new TransferSessionStore(workspace).currentContext();var marker=new PendingBundleTransferStore(workspace).read();
+        String session=context!=null&&context.scopeId().equals(id)&&context.kind()==ReliableTransferEngine.Kind.PROJECT&&context.direction()==ReliableTransferEngine.Direction.VM_TO_HOST?context.session():context==null&&marker!=null&&marker.projectId().equals(id)?marker.session():null;
+        return session!=null&&endedTransfers(id).stream().anyMatch(t->t.session().equals(session));
+    }
+    /** Finish an interrupted explicit restore or end whose active pointer still occupies the slot. */
+    public void repairEndedRestore(String id)throws IOException{if(needsEndedRestore(id))restoreEndedTransfer(id);}
+    /** Archive recovery data before releasing active occupancy; no baseline or transport progress is deleted. */
+    public void endAutomaticTransfer(String id,String session)throws IOException{
+        require(config.role()==Role.VM,"仅 VM Bundle 使用此恢复路径");var active=new PendingBundleTransferStore(workspace);var marker=active.read();
+        if(marker==null){new TransferSessionStore(workspace).clearContext(session);return;}
+        require(marker.projectId().equals(id)&&marker.session().equals(session),"结束会话与当前 Bundle 不匹配");
+        var sessions=new TransferSessionStore(workspace);var context=sessions.currentContext();require(context==null||(context.session().equals(session)&&context.scopeId().equals(id)&&context.transferId().equals(marker.transferId())&&context.kind()==ReliableTransferEngine.Kind.PROJECT&&context.direction()==ReliableTransferEngine.Direction.VM_TO_HOST&&context.total()==marker.total()),"当前传输上下文不匹配");
+        byte[] target=SafeFiles.read(state("pending",id));Payload payload=Codec.decode(target);require(payload.git()!=null&&payload.git().snapshot().equals(marker.transferId())&&payload.project().equals(id),"待确认 Bundle 不匹配");
+        Payload source=new ProjectOutgoingStore(workspace).load(session);require(source.git()!=null&&source.git().snapshot().equals(marker.transferId())&&source.project().equals(id),"恢复发送源不匹配");
+        Path dir=endedRoot().resolve(session);SafeFiles.noLinks(dir);Files.createDirectories(dir);
+        SafeFiles.atomicWrite(dir.resolve("target.gz"),target);SafeFiles.atomicWrite(dir.resolve("baseline.sha256"),baselineHash(id).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        PendingBundleTransferStore.archived(workspace,session).mark(marker);
+        sessions.clearContext(session);active.clear(id,session);
+    }
+    /** Explicitly reattach the most recently ended send; a newer active transfer or baseline takes precedence. */
+    public void restoreEndedTransfer(String id)throws IOException{
+        require(config.role()==Role.VM,"仅 VM Bundle 使用此恢复路径");var candidates=endedTransfers(id);require(!candidates.isEmpty(),"没有可恢复的发送会话");var existingContext=new TransferSessionStore(workspace).currentContext();var existingMarker=new PendingBundleTransferStore(workspace).read();String activeSession=existingContext!=null?existingContext.session():existingMarker!=null?existingMarker.session():null;var marker=activeSession==null?candidates.getFirst():candidates.stream().filter(t->t.session().equals(activeSession)).findFirst().orElseThrow(()->new IOException("已有其他传输，不能恢复旧会话"));
+        var active=new PendingBundleTransferStore(workspace);var sessions=new TransferSessionStore(workspace);var context=sessions.currentContext();var current=active.read();
+        require(current==null||current.equals(marker),"已有其他待确认 Bundle，不能恢复旧会话");require(context==null||context.equals(new TransferSessionStore.Context(marker.session(),id,marker.transferId(),ReliableTransferEngine.Kind.PROJECT,ReliableTransferEngine.Direction.VM_TO_HOST,marker.total())),"已有其他传输，不能恢复旧会话");
+        Path dir=endedRoot().resolve(marker.session());String original=new String(SafeFiles.read(dir.resolve("baseline.sha256"),64),java.nio.charset.StandardCharsets.US_ASCII);require(original.equals(baselineHash(id)),"已确认基线已改变，不能恢复旧会话；旧数据仍保留");
+        byte[] target=SafeFiles.read(dir.resolve("target.gz"));Payload payload=Codec.decode(target);require(payload.project().equals(id)&&payload.policy().equals(config.policy())&&payload.git()!=null&&payload.git().snapshot().equals(marker.transferId()),"恢复 Bundle 与配置不匹配");
+        var source=new ProjectOutgoingStore(workspace);Payload outgoing=source.load(marker.session());require(outgoing.git()!=null&&outgoing.git().snapshot().equals(marker.transferId())&&outgoing.project().equals(id)&&outgoing.policy().equals(config.policy()),"恢复发送源不匹配");source.loadParts(marker.session(),null,marker.total());
+        // Context first blocks generation if interruption occurs while restoring the pending target.
+        sessions.saveContext(new TransferSessionStore.Context(marker.session(),id,marker.transferId(),ReliableTransferEngine.Kind.PROJECT,ReliableTransferEngine.Direction.VM_TO_HOST,marker.total()));
+        SafeFiles.atomicWrite(state("pending",id),target);active.mark(marker);PendingBundleTransferStore.archived(workspace,marker.session()).clear(id,marker.session());
+    }
     private static Payload attach(Payload p,GitData git){return new Payload(p.type(),p.project(),p.head(),p.policy(),p.entries(),git);}
     public SyncEngine.Generated scan(String id)throws IOException{
         require(config.role()==Role.VM,"仅 VM 可生成 Bundle");SyncEngine.Generated full=engine.generate(id);
@@ -79,6 +119,7 @@ public final class BundleSync {
     }
     public void acceptReceipt(String id,Payload receipt)throws IOException{
         Codec.validate(receipt);require(config.role()==Role.VM&&receipt.type()==Type.ACK&&receipt.project().equals(id)&&receipt.policy().equals(config.policy()),"回执项目/角色/排除规则不匹配");
+        require(endedTransfers(id).stream().noneMatch(t->t.transferId().equals(receipt.git().snapshot())),"回执所属会话已结束；请先明确恢复该会话");
         Path pending=state("pending",id);require(Files.exists(pending),"没有待确认的发送包");Payload sent=Codec.decode(SafeFiles.read(pending));
         require(sent.git()!=null&&sent.git().snapshot().equals(receipt.git().snapshot())&&sent.git().parent().equals(receipt.git().parent())&&sent.head().equals(receipt.head()),"回执不是最近生成的包；请重新同步该包或全量初始化");
         Path ack=state("acknowledged",id);

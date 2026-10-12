@@ -37,13 +37,13 @@ public final class FileTransferConfigTest {
         Path workspace=Files.createTempDirectory("file-chunk-config-").toRealPath();
         try{
             Path source=workspace.resolve("sample.bin");Files.write(source,new byte[300_000]);
-            FileTransferConfig.saveIfConfirmed(workspace,Config.parse(Config.TEMPLATE),true);
+            FileTransferConfig.saveIfConfirmed(workspace,Config.parse(Config.TEMPLATE.replace("focus-delay-ms: 300","focus-delay-ms: 750")),true);
             Config original=FileTransferConfig.read(workspace);
             FileTransferConfig.saveChunkSize(workspace,256);
             var first=FileTransferConfig.generate(workspace,source);
             check(first.metadata().chunkBytes()==196608&&first.metadata().count()==2,"file generation uses configured 256 KiB instead of legacy 128");
             Config changed=FileTransferConfig.read(workspace);
-            check(changed.role()==original.role()&&changed.projects().equals(original.projects())&&changed.exclude().equals(original.exclude())&&changed.identity().equals(original.identity())&&changed.git().equals(original.git()),"chunk setting preserves other settings");
+            check(changed.role()==original.role()&&changed.projects().equals(original.projects())&&changed.exclude().equals(original.exclude())&&changed.identity().equals(original.identity())&&changed.git().equals(original.git())&&changed.focusDelayMs()==750,"chunk setting preserves other settings");
             FileTransferConfig.saveChunkSize(workspace,512);
             var second=FileTransferConfig.generate(workspace,source);
             check(second.metadata().count()==1&&first.metadata().count()==2,"next generation reloads settings without changing existing transfer snapshot");

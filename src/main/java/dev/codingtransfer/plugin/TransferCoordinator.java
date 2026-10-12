@@ -20,11 +20,10 @@ public final class TransferCoordinator implements Disposable {
     private static final long TERMINAL_RETENTION_MILLIS = 180_000;
     private static final int MAX_RETRIES = 8;
     private static final long RETRY_INTERVAL_MILLIS = 10_000;
-    private static final long FINAL_RETRY_WAIT_MILLIS = 10_000;
     private final ScheduledThreadPoolExecutor worker;
     private final ClipboardAccess clipboard;
-    @FunctionalInterface interface InputPulse {String send(boolean left) throws Exception;}
-    private final InputPulse inputPulse;
+    @FunctionalInterface interface FocusPulse {String send() throws Exception;}
+    private final FocusPulse focusPulse;
     private final Consumer<Runnable> dispatcher;
     private final LongSupplier clock;
     private final Map<String,TerminalResponse> terminalResponses=new HashMap<>();
@@ -43,7 +42,8 @@ public final class TransferCoordinator implements Disposable {
     public record StatusEvent(String sessionKey,String eventKey,String text,boolean complete) {}
     public record FrameInfo(String sessionId,String type,int index,int total) {}
     @FunctionalInterface public interface FrameDescriber { FrameInfo describe(String frame) throws Exception; }
-    public record LogContext(Path workspace,String endpoint,String uiSessionKey,FrameDescriber describer,BooleanSupplier enabled,boolean hostInputAssist) {
+    public record LogContext(Path workspace,String endpoint,String uiSessionKey,FrameDescriber describer,BooleanSupplier enabled,boolean hostFocusAssist,int focusDelayMs) {
+        public LogContext(Path workspace,String endpoint,String uiSessionKey,FrameDescriber describer,BooleanSupplier enabled,boolean hostFocusAssist){this(workspace,endpoint,uiSessionKey,describer,enabled,hostFocusAssist,dev.codingtransfer.core.Config.DEFAULT_FOCUS_DELAY_MS);}
         public LogContext(Path workspace,String endpoint,String uiSessionKey,FrameDescriber describer,BooleanSupplier enabled){this(workspace,endpoint,uiSessionKey,describer,enabled,false);}
         public LogContext(Path workspace,String endpoint,String uiSessionKey,FrameDescriber describer){this(workspace,endpoint,uiSessionKey,describer,()->true);}
     }
@@ -62,14 +62,14 @@ public final class TransferCoordinator implements Disposable {
     }
     public interface ClipboardAccess { String read() throws Exception; default String read(boolean diagnostics)throws Exception{return read();} default String readDiagnostics(){return "";} void write(String value) throws Exception; default String backendName(){return "custom";} default long revision()throws Exception{return -1;} default long lastWriteRevision(){return -1;} }
     private static final class TerminalResponse {
-        final String identity,peerFrame,responseFrame;final long expiresAt;String lastObservedText;
-        TerminalResponse(String identity,String peerFrame,String responseFrame,long now){this.identity=identity;this.peerFrame=peerFrame;this.responseFrame=responseFrame;lastObservedText=responseFrame;expiresAt=now+TERMINAL_RETENTION_MILLIS;}
+        final String identity,peerFrame,responseFrame;final long expiresAt;String lastObservedText;long lastSentAt;int retries;final FrameDescriber describer;final FrameInfo completion;
+        TerminalResponse(String identity,String peerFrame,String responseFrame,long now,FrameDescriber describer,FrameInfo completion){this.describer=describer;this.completion=completion;this.identity=identity;this.peerFrame=peerFrame;this.responseFrame=responseFrame;lastObservedText=responseFrame;lastSentAt=now;expiresAt=now+TERMINAL_RETENTION_MILLIS;}
     }
 
     private static final class Active {
         final TransferSessionLease lease = new TransferSessionLease();
-        final TransferInputAssist inputAssist = new TransferInputAssist();
-        boolean inputAssistFailed;
+        final TransferFocusAssist focusAssist;
+        boolean focusAssistFailed;
         String diagnosticText,diagnosticRoute;
         long diagnosticAt;
         final String identity;
@@ -79,7 +79,6 @@ public final class TransferCoordinator implements Disposable {
         String lastPeerFrame;
         long lastSentAt;
         int retries;
-        long lastRetrySlot=Long.MIN_VALUE;
         boolean paused;
         boolean stopped;
         boolean awaitingUserAction;
@@ -104,7 +103,7 @@ public final class TransferCoordinator implements Disposable {
         String completionEventKey="COMPLETE";
         final java.util.ArrayDeque<String> deferredPeerFrames=new java.util.ArrayDeque<>();
         Active(String identity,String initial,LogContext logContext){
-            this.identity=identity;currentFrame=initial;this.logContext=logContext;
+            this.identity=identity;currentFrame=initial;this.logContext=logContext;focusAssist=new TransferFocusAssist(logContext==null?dev.codingtransfer.core.Config.DEFAULT_FOCUS_DELAY_MS:logContext.focusDelayMs());
             statusSessionKey=logContext==null||logContext.uiSessionKey()==null?java.util.UUID.randomUUID().toString():logContext.uiSessionKey();
             retryEnabled=initial!=null;
         }
@@ -127,10 +126,10 @@ public final class TransferCoordinator implements Disposable {
     String clipboardBackendName(){return clipboard.backendName();}
 
     TransferCoordinator(ClipboardAccess clipboard,Consumer<Runnable> dispatcher,LongSupplier clock,ScheduledThreadPoolExecutor worker){
-        this(clipboard,dispatcher,clock,worker,RdpKeyboardAssist::pulse);
+        this(clipboard,dispatcher,clock,worker,RdpFocusAssist::pulse);
     }
-    TransferCoordinator(ClipboardAccess clipboard,Consumer<Runnable> dispatcher,LongSupplier clock,ScheduledThreadPoolExecutor worker,InputPulse inputPulse){
-        this.inputPulse=inputPulse;this.clipboard=clipboard;this.dispatcher=dispatcher;this.clock=clock;this.worker=worker;
+    TransferCoordinator(ClipboardAccess clipboard,Consumer<Runnable> dispatcher,LongSupplier clock,ScheduledThreadPoolExecutor worker,FocusPulse focusPulse){
+        this.focusPulse=focusPulse;this.clipboard=clipboard;this.dispatcher=dispatcher;this.clock=clock;this.worker=worker;
         worker.setRemoveOnCancelPolicy(true);
     }
 
@@ -155,16 +154,19 @@ public final class TransferCoordinator implements Disposable {
         if(active!=null&&!active.stopped)throw new IllegalStateException("已有一个项目/文件传输正在运行");
         if(owner==null||identity==null||!identity.matches("[A-Za-z0-9_-]{1,128}")||handler==null||listener==null)
             throw new IllegalArgumentException("传输会话参数无效");
-        Active session=new Active(identity,initial,logContext);session.lease.bind(owner,handler,listener);active=session;session.inputAssist.arm(null,clock.getAsLong());
-        InitialPresentation presentation=publish?initialPresentation(session,initial,restoring):new InitialPresentation("等待发送端开始","WAIT_INVITE","等待发送端开始",false,"COMPLETE");
+        Active session=new Active(identity,initial,logContext);session.lease.bind(owner,handler,listener);active=session;session.focusAssist.arm(null,clock.getAsLong());
+        InitialPresentation presentation=initial!=null?initialPresentation(session,initial,restoring):new InitialPresentation("等待发送端开始","WAIT_INVITE","等待发送端开始",false,"COMPLETE");
         session.eventKey=presentation.waitEventKey();session.completionEventKey=presentation.completeEventKey();
+        session.retryEnabled=canRetry(session);
+        FrameInfo restoredInfo=restoring?describe(session,initial):null;
+        if(restoredInfo!=null&&(restoredInfo.type().equals("DATA")||restoredInfo.type().equals("FINAL")))publish=false;
         if(publish){
             post(session,"START_PUBLISH",presentation.startText());
             log(session,"START",initial,"state="+presentation.waitEventKey()+" publication=starting",null);
             worker.execute(()->{try{
                 writeForSession(session,initial);session.lastSentAt=clock.getAsLong();session.currentPublished=true;
                 log(session,"SEND",initial,"publication=complete",null);
-                if(presentation.terminal())stopInternal(session,StopReason.COMPLETED,presentation.sentText(),true);
+                if(presentation.terminal()){retainTerminalResponse(session,null,initial);stopInternal(session,StopReason.COMPLETED,presentation.sentText(),true);}
                 else post(session,presentation.waitEventKey(),assistHint(session,presentation.sentText()));
             }catch(Throwable error){
                 session.lastSentAt=clock.getAsLong();String startup=WindowsClipboardBackend.startupLogFields(error);
@@ -173,7 +175,7 @@ public final class TransferCoordinator implements Disposable {
                 String status=windowsStartup==null?"无法启动传输："+message(error)+"；已停止监听，可点击继续确认重试":windowsStartup.safeSummary()+"；已停止监听，可点击继续确认重试";
                 stopInternal(session,StopReason.USER_PAUSED,status);
             }});
-        }else{post(session,"WAIT_INVITE",assistHint(session,restoring?"继续监听待确认消息":"等待发送端开始"));log(session,restoring?"LISTEN_RESTORE":"LISTEN",null,"state=WAIT_INVITE",null);}
+        }else{post(session,session.eventKey,assistHint(session,restoring&&initial!=null?presentation.sentText()+"；监听接收端请求或确认":restoring?"继续监听待确认消息":"等待发送端开始"));log(session,restoring?"LISTEN_RESTORE":"LISTEN",null,"state="+session.eventKey,null);}
         schedule(session);
     }
 
@@ -186,6 +188,7 @@ public final class TransferCoordinator implements Disposable {
             case "DATA"->new InitialPresentation("正在重发第 "+info.index()+" 块","WAIT_ACK_DATA_"+info.index(),"继续确认中 · 等待第 "+info.index()+" 块确认",false,"COMPLETE");
             case "FINAL"->new InitialPresentation("正在重发最终帧","WAIT_FINAL_ACK","继续确认中 · 等待最终确认",false,"COMPLETE");
             case "FINAL_ACK"->new InitialPresentation("正在重发最终确认","FINAL_ACK_REPUBLISHED",TransferCompletionText.format("重发最终确认已发布，传输已完成",info.total()),true,"FINAL_ACK_REPUBLISHED");
+            case "REQUEST"->new InitialPresentation("正在请求第 "+info.index()+" 块","WAIT_DATA_"+info.index(),"继续确认中 · 等待第 "+info.index()+" 块",false,"COMPLETE");
             case "BLOCK_ACK"->info.index()==info.total()
                     ?new InitialPresentation("正在重发最后一块确认","WAIT_DATA_COMPLETION","已接收 "+info.total()+" / "+info.total()+" 块 · 继续完成校验、应用或确认",false,"COMPLETE")
                     :new InitialPresentation("正在重发第 "+info.index()+" 块确认","WAIT_DATA_"+(info.index()+1),"继续确认中 · 等待第 "+(info.index()+1)+" 块",false,"COMPLETE");
@@ -276,7 +279,7 @@ public final class TransferCoordinator implements Disposable {
                 post(session,"CLIPBOARD_ERROR","读取剪贴板失败："+message(e));
                 // A transient read failure must not starve input assistance. Do not publish
                 // a retry without observing the clipboard: it may contain a peer response.
-                maybeAssistInput(session,clock.getAsLong());
+                maybeAssistFocus(session,clock.getAsLong());
             }
             return;
         }
@@ -295,7 +298,7 @@ public final class TransferCoordinator implements Disposable {
             if(!deferred.equals(session.lastPeerFrame))processPeerFrame(session,deferred,now);
             session.lastObservedText=readClipboardQuietly(session,text);return;
         }
-        if((session.currentFrame!=null&&sameFrame(text,session.currentFrame))||sameFrame(text,session.ownEchoFrame)){recoverSlot(session,text,now,true);maybeAssistInput(session,now);return;}
+        if((session.currentFrame!=null&&sameFrame(text,session.currentFrame))||sameFrame(text,session.ownEchoFrame)){recoverSlot(session,text,now,true);maybeAssistFocus(session,now);return;}
         if(sameFrame(text,session.lastPeerFrame)){
             if(session.replayLastPeerResponse&&session.lastPeerResponse!=null)replayResponse(session,text);
             session.lastObservedText=text;
@@ -303,7 +306,7 @@ public final class TransferCoordinator implements Disposable {
         }
         if(text.startsWith(session.identity+" ")){processPeerFrame(session,text,now);session.lastObservedText=readClipboardQuietly(session,text);return;}
         recoverSlot(session,text,now,false);
-        maybeAssistInput(session,now);
+        maybeAssistFocus(session,now);
         session.lastObservedText=text;
     }
 
@@ -318,6 +321,7 @@ public final class TransferCoordinator implements Disposable {
                 text.startsWith(session.identity+" ")?"PROCESS_PEER_PENDING":!text.isEmpty()?"RECOVER_UNPROCESSABLE":"PENDING_RESPONSE_EMPTY";
         else if(!session.deferredPeerFrames.isEmpty())route="PROCESS_DEFERRED";
         else if(sameFrame(text,session.currentFrame))route="WAIT_ON_LOCAL_FRAME";
+        else if(sameFrame(text,session.ownEchoFrame))route="RECOVER_STALE_LOCAL_ECHO";
         else if(sameFrame(text,session.lastPeerFrame))route=session.replayLastPeerResponse&&session.lastPeerResponse!=null?
             "REPLAY_DUPLICATE_ACK":"IGNORE_DUPLICATE_PEER";
         else if(text.startsWith(session.identity+" "))route=text.equals(session.failedPeerFrame)&&now<session.nextHandlerAttemptAt?"HANDLER_BACKOFF":"PROCESS_PEER";
@@ -343,7 +347,7 @@ public final class TransferCoordinator implements Disposable {
             if(outcome.responseFrame()!=null){session.pendingPeerFrame=text;session.pendingResponse=outcome.responseFrame();session.pendingOutcome=outcome;publishPendingResponse(session);}
             else{commitPeerFrame(session,text,outcome);applyOutcomeWithoutResponse(session,outcome);}
         }catch(OwnFrame own){
-            session.ownEchoFrame=text;log(session,"IGNORE",null,"reason=own_frame_echo",null);maybeAssistInput(session,now);
+            session.ownEchoFrame=text;log(session,"IGNORE",null,"reason=own_frame_echo",null);maybeAssistFocus(session,now);
         }catch(dev.codingtransfer.core.ReliableTransferEngine.RejectedFrame|UnprocessableFrame invalid){
             log(session,"IGNORE",null,"reason=unprocessable_peer",null);
             recoverSlot(session,text,now,false);
@@ -373,7 +377,7 @@ public final class TransferCoordinator implements Disposable {
             session.pendingPeerFrame=null;session.pendingResponse=null;session.pendingOutcome=null;
             if(outcome.status()!=null)post(session,session.eventKey,outcome.status());
             if(outcome.complete()){
-                retainTerminalResponse(session.identity,peer,response);log(session,"COMPLETE",response,"",null);
+                retainTerminalResponse(session,peer,response);log(session,"COMPLETE",response,"",null);
                 stopInternal(session,StopReason.COMPLETED,outcome.status()==null?"业务操作已完成":outcome.status(),true);
             }
         }catch(Throwable e){
@@ -399,52 +403,45 @@ public final class TransferCoordinator implements Disposable {
         try{
             if(!sameFrame(peer,readClipboard(session)))return;
             writeForSession(session,session.lastPeerResponse);session.currentFrame=session.lastPeerResponse;session.currentPublished=true;
-            session.lastSentAt=clock.getAsLong();session.retryEnabled=false;session.retries=0;
+            session.lastSentAt=clock.getAsLong();session.retries=0;
             log(session,"ACK",session.lastPeerResponse,"reason=duplicate_peer_frame",null);
         }catch(Throwable e){log(session,"ERROR",session.lastPeerResponse,"classification=ACK_REPLAY",e);}
     }
 
-    private static String assistHint(Active session,String text){return session.logContext!=null&&session.logContext.hostInputAssist()?text+"；请保持远端 VM 窗口在前台且勿操作，等待时会辅助发送一个方向键，←、→ 交替":text;}
+    private static String assistHint(Active session,String text){return session.logContext!=null&&session.logContext.hostFocusAssist()?text+"；请保持远端 VM 窗口在前台且勿操作，发布后等待进度超过 "+session.logContext.focusDelayMs()+" 毫秒时会短暂切换焦点并返回原客户端，切回后观察至少 3 秒":text;}
 
-    private void maybeAssistInput(Active session,long now){
-        if(session.logContext==null||!session.logContext.hostInputAssist()||session.inputAssistFailed)return;
+    private void maybeAssistFocus(Active session,long now){
+        if(session.logContext==null||!session.logContext.hostFocusAssist()||session.focusAssistFailed)return;
         synchronized(this){
             if(active!=session||session.stopped||session.paused||session.awaitingUserAction)return;
-            if(!session.inputAssist.claim(now,true))return;
+            if(!session.focusAssist.claim(now,true))return;
+            long waited=session.focusAssist.waitedMillis(now),started=System.nanoTime();
             try{
-                boolean left=session.inputAssist.nextLeft();
-                String result=inputPulse.send(left);
-                if(result.equals("sent")){session.inputAssist.sent();session.inputAssist.defer(clock.getAsLong());}
-                log(session,"INPUT_ASSIST",null,"result="+result+" direction="+(left?"LEFT":"RIGHT"),null);
+                String result=focusPulse.send();
+                if(result.equals("switched")){session.focusAssist.sent();session.focusAssist.defer(clock.getAsLong());}
+                log(session,"FOCUS_ASSIST",null,"result="+result+" wait_ms="+waited+" duration_ms="+((System.nanoTime()-started)/1_000_000L)+" frame_chars="+(session.currentFrame==null?0:session.currentFrame.length()),null);
                 if(result.equals("user_active")||result.equals("not_rdp")||result.equals("no_window")||result.equals("focus_changed"))
-                    session.inputAssist.defer(clock.getAsLong());
-                if(result.equals("permission_or_os_error")||result.equals("timeout")||result.equals("os_error")){
-                    session.inputAssistFailed=true;
-                    post(session,"INPUT_ASSIST_UNAVAILABLE","方向键辅助不可用；请检查系统自动化/辅助功能权限，本次会话不再尝试");
+                    session.focusAssist.defer(clock.getAsLong());
+                if(result.equals("focus_interrupted")){session.focusAssistFailed=true;post(session,"FOCUS_ASSIST_STOPPED","焦点切换被窗口变化或用户操作中断，本次会话不再尝试");}
+                if(result.equals("permission_or_os_error")||result.equals("timeout")||result.equals("os_error")||result.equals("unsupported")){
+                    session.focusAssistFailed=true;
+                    post(session,"FOCUS_ASSIST_UNAVAILABLE","焦点切换辅助不可用；请检查远程窗口状态及 IDEA 辅助功能权限，本次会话不再尝试");
                 }
-            }catch(Exception|LinkageError failure){session.inputAssistFailed=true;log(session,"INPUT_ASSIST",null,"result=unavailable",failure);post(session,"INPUT_ASSIST_UNAVAILABLE","方向键辅助不可用，本次会话不再尝试");}
+            }catch(Exception|LinkageError failure){session.focusAssistFailed=true;log(session,"FOCUS_ASSIST",null,"result=unavailable wait_ms="+waited+" duration_ms="+((System.nanoTime()-started)/1_000_000L),failure);post(session,"FOCUS_ASSIST_UNAVAILABLE","焦点切换辅助不可用，本次会话不再尝试");}
         }
     }
 
-    /** DATA and BLOCK_ACK use disjoint wall-clock slots; normal responses remain immediate. */
+    /** A single retry owner: receiver requests/receipts. INVITE is the bootstrap exception. */
+    private boolean canRetry(Active session){
+        // Retry ownership follows the protocol phase, without decrypting large DATA on every poll.
+        return !session.eventKey.startsWith("WAIT_ACK_DATA_")
+                &&!java.util.Set.of("WAIT_FINAL_ACK","WAIT_BUSINESS_CONFIRMATION","WAIT_FILE_VERIFIED").contains(session.eventKey);
+    }
     private void recoverSlot(Active session,String observed,long now,boolean own){
         if(session.paused||session.stopped||session.awaitingUserAction||session.currentFrame==null)return;
-        boolean data=session.eventKey.startsWith("WAIT_ACK_DATA_");
-        // WAIT_DATA_1 denotes READY. BLOCK_ACK handlers and restoration use WAIT_DATA_(index+1).
-        boolean ack=session.eventKey.startsWith("WAIT_DATA_")&&!session.eventKey.equals("WAIT_DATA_1");
-        if(own){
-            if(!session.currentPublished||!(data||ack)||!sameFrame(observed,session.currentFrame))return;
-        }else if(sameFrame(observed,session.currentFrame)||sameFrame(observed,session.ownEchoFrame))return;
-        boolean scheduled=data||ack;
-        long slot=Math.floorDiv(now,1000L);int second=(int)Math.floorMod(slot,10L);
-        if(session.retries>=MAX_RETRIES){
-            if(now-session.lastSentAt<FINAL_RETRY_WAIT_MILLIS)return;
-        }else if(scheduled){
-            if(!(data?(second==1||second==6):(second==4||second==8))||slot<=session.lastRetrySlot)return;
-            // Consume this slot even if publication must be skipped. Never catch up a missed slot.
-            session.lastRetrySlot=slot;
-            if(now-session.lastSentAt<1_000L)return;
-        }else if(now-session.lastSentAt<RETRY_INTERVAL_MILLIS)return;
+        if(session.pendingResponse==null&&(!session.retryEnabled||!canRetry(session)))return;
+        if(own&&!session.currentPublished)return;
+        if(now-session.lastSentAt<RETRY_INTERVAL_MILLIS)return;
         try{
             long revision=clipboard.revision();
             String latest=readClipboard(session);if(latest==null)latest="";
@@ -452,13 +449,11 @@ public final class TransferCoordinator implements Disposable {
             if(session.retries>=MAX_RETRIES){
                 stopInternal(session,StopReason.RETRY_EXHAUSTED,"重试后仍未收到有效响应；已暂停，可继续确认",true);return;
             }
-            // Reading a delayed RDP clipboard can block beyond the permitted second.
-            if(scheduled&&Math.floorDiv(clock.getAsLong(),1000L)!=slot)return;
             session.retries++;session.lastSentAt=clock.getAsLong();
             if(session.pendingResponse!=null){publishPendingResponse(session,latest);return;}
             writeForSession(session,session.currentFrame);session.lastSentAt=clock.getAsLong();
-            log(session,own?(ack?"ACK_REFRESH":"DATA_REFRESH"):"RECOVER_SLOT",session.currentFrame,
-                "reason="+(own?"wall_clock_slot":"foreign_unprocessable")+" attempts="+session.retries+(scheduled?" slot_epoch_second="+slot:""),null);
+            log(session,own?"REQUEST_REFRESH":"RECOVER_SLOT",session.currentFrame,
+                "reason="+(own?"receiver_timeout":"foreign_unprocessable")+" attempts="+session.retries,null);
         }catch(Throwable error){session.lastSentAt=clock.getAsLong();log(session,"ERROR",session.currentFrame,"classification=SLOT_RECOVERY",error);}
     }
 
@@ -503,7 +498,7 @@ public final class TransferCoordinator implements Disposable {
     private static void resetIoMetrics(Active session){session.readCount=session.readTotalNanos=session.readMaxNanos=session.writeCount=session.writeTotalNanos=session.writeMaxNanos=session.pollGapTotalNanos=session.pollGapMaxNanos=session.pollGapCount=0;}
     private void recordIo(Active session,boolean write,long nanos){if(write){session.writeCount++;session.writeTotalNanos+=nanos;session.writeMaxNanos=Math.max(session.writeMaxNanos,nanos);}else{session.readCount++;session.readTotalNanos+=nanos;session.readMaxNanos=Math.max(session.readMaxNanos,nanos);}}
 
-    private void writeForSession(Active session,String text){writeClipboard(session,text);if(!sameFrame(text,session.lastLocalOutput)){session.retries=0;}session.localWriteRevision=clipboard.lastWriteRevision();session.lastLocalOutput=text;session.lastObservedText=text;session.inputAssist.arm(text,clock.getAsLong());}
+    private void writeForSession(Active session,String text){writeClipboard(session,text);if(!sameFrame(text,session.lastLocalOutput)){session.retries=0;}session.localWriteRevision=clipboard.lastWriteRevision();session.lastLocalOutput=text;session.lastObservedText=text;session.focusAssist.arm(text,clock.getAsLong());}
     private void deferPeerFrame(Active session,String text){
         if(session.deferredPeerFrames.contains(text))return;
         if(session.deferredPeerFrames.size()>=8){session.paused=true;log(session,"PAUSE",null,"reason=DEFERRED_FRAME_LIMIT",null);post(session,"DEFERRED_LIMIT","待处理协议帧过多，已暂停以避免丢帧");return;}
@@ -511,10 +506,19 @@ public final class TransferCoordinator implements Disposable {
     }
     private String readClipboardQuietly(Active session,String fallback){try{String value=readClipboard(session);return value==null?"":value;}catch(Exception ignored){return fallback;}}
 
-    private synchronized void retainTerminalResponse(String identity,String peerFrame,String responseFrame){
-        long now=clock.getAsLong();terminalResponses.put(peerFrame,new TerminalResponse(identity,peerFrame,responseFrame,now));
+    private synchronized void retainTerminalResponse(Active session,String peerFrame,String responseFrame){
+        long now=clock.getAsLong();terminalResponses.put(peerFrame,new TerminalResponse(session.identity,peerFrame,responseFrame,now,session.logContext==null?null:session.logContext.describer(),describe(session,responseFrame)));
         while(terminalResponses.size()>32)terminalResponses.remove(terminalResponses.keySet().iterator().next());
         if(terminalPollTask==null||terminalPollTask.isDone())terminalPollTask=worker.scheduleWithFixedDelay(this::pollTerminalResponses,POLL_MILLIS,POLL_MILLIS,TimeUnit.MILLISECONDS);
+    }
+
+    private boolean terminalSessionFrame(TerminalResponse item,String text){
+        if(item.describer==null||item.completion==null||item.completion.sessionId()==null||!text.startsWith(item.identity+" "))return false;
+        try{
+            FrameInfo frame=item.describer.describe(text);
+            return frame!=null&&item.completion.sessionId().equals(frame.sessionId())&&item.completion.total()==frame.total()
+                    &&java.util.Set.of("INVITE","REQUEST","DATA","READY","BLOCK_ACK","MISSING","RECEIVED","BUSINESS_ACK","FINAL","FINAL_ACK").contains(frame.type());
+        }catch(Exception invalid){return false;}
     }
 
     private void pollTerminalResponses(){
@@ -532,8 +536,16 @@ public final class TransferCoordinator implements Disposable {
             }
             if(active==null){
                 for(TerminalResponse item:terminalResponses.values()){
-                    if(text.equals(item.peerFrame)&&!text.equals(item.lastObservedText)){
-                        try{writeClipboard(null,item.responseFrame);item.lastObservedText=item.responseFrame;}catch(Throwable ignored){}
+                    boolean duplicate=text.equals(item.peerFrame)&&!text.equals(item.lastObservedText);
+                    boolean retry=item.retries<MAX_RETRIES&&now-item.lastSentAt>=RETRY_INTERVAL_MILLIS
+                            &&(text.equals(item.responseFrame)||terminalSessionFrame(item,text));
+                    if(duplicate||retry){
+                        try{
+                            long revision=clipboard.revision();
+                            if(!text.equals(readClipboard(null))||(revision>=0&&clipboard.revision()!=revision))break;
+                            writeClipboard(null,item.responseFrame);item.lastObservedText=item.responseFrame;item.lastSentAt=now;
+                            if(retry)item.retries++;
+                        }catch(Throwable ignored){}
                         break;
                     }
                 }
@@ -597,7 +609,7 @@ public final class TransferCoordinator implements Disposable {
     }
     private String keyFor(String frame,Active session,String fallback){FrameInfo info=describe(session,frame);if(info==null)return fallback;return switch(info.type()){
         case "INVITE"->"WAIT_READY";case "DATA"->"WAIT_ACK_DATA_"+info.index();case "FINAL"->"WAIT_FINAL_ACK";
-        case "BLOCK_ACK"->"WAIT_DATA_"+(info.index()+1);case "READY"->"WAIT_DATA_1";case "BUSINESS_ACK","RECEIVED"->"WAIT_FINAL";default->fallback;};}
+        case "REQUEST"->"WAIT_DATA_"+info.index();case "BLOCK_ACK"->"WAIT_DATA_"+(info.index()+1);case "READY"->"WAIT_DATA_1";case "BUSINESS_ACK","RECEIVED"->"WAIT_FINAL";default->fallback;};}
     private String frameType(Active session,String frame,String fallback){FrameInfo info=describe(session,frame);if(info==null)return fallback;return info.type().equals("BLOCK_ACK")?"ACK":"SEND";}
     synchronized boolean hasActiveTransfer(){return active!=null&&!active.stopped;}
     private static String failureSummary(Throwable error){

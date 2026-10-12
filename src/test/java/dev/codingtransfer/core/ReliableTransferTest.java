@@ -10,6 +10,99 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class ReliableTransferTest {
     private ReliableTransferTest() {}
 
+    private static void receiverDrivenRequests(Path fixture)throws Exception {
+        // A pull request is a compact authenticated control, never a DATA payload.
+        ReliableTransferEngine.Type request;
+        try { request=ReliableTransferEngine.Type.valueOf("REQUEST"); }
+        catch(IllegalArgumentException missing){throw new AssertionError("receiver-driven REQUEST is not implemented",missing);}
+        byte[] key=new byte[32];String session=UUID.randomUUID().toString();
+        var message=new ReliableTransferEngine.Message(session,"repo","pull",ReliableTransferEngine.Kind.PROJECT,
+                ReliableTransferEngine.Direction.HOST_TO_VM,request,1,3,new byte[0]);
+        String wire=ReliableTransferEngine.encode("pair",key,message);
+        TestSupport.check(wire.length()<512&&ReliableTransferEngine.decode("pair",key,wire).equals(message),"request is small and preserves requested index");
+        for(var direction:ReliableTransferEngine.Direction.values()) {
+            var kind=direction==ReliableTransferEngine.Direction.FILE?ReliableTransferEngine.Kind.FILE:ReliableTransferEngine.Kind.PROJECT;
+            Path sendPath=java.nio.file.Files.createDirectory(fixture.resolve("pull-send-"+direction)),receivePath=java.nio.file.Files.createDirectory(fixture.resolve("pull-receive-"+direction));
+            var sendStore=new TransferSessionStore(sendPath);var receiveStore=new TransferSessionStore(receivePath);
+            var sender=ReliableTransferEngine.sender("pair",key,sendStore);var receiver=ReliableTransferEngine.receiver("pair",key,receiveStore);
+            String invitation=sender.prepare(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.INVITE,0,3,new byte[0]));
+            String request1=receiver.acceptPullInviteResult(invitation).readyFrame();
+            TestSupport.check(ReliableTransferEngine.decode("pair",key,request1).type()==request&&sender.acceptRequest(request1)==1,"receiver requests first block");
+            var future=new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,request,3,3,new byte[0]);
+            final var initialSender=sender;
+            fails(()->initialSender.acceptRequest(ReliableTransferEngine.encode("pair",key,future)),"request cannot skip unprepared blocks");
+            String data1=sender.prepare(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.DATA,1,3,new byte[]{1}));
+            String outOfTurn=ReliableTransferEngine.encode("pair",key,new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.DATA,2,3,new byte[]{2}));
+            final var invitedReceiver=receiver;AtomicInteger invalidWrites=new AtomicInteger();
+            fails(()->invitedReceiver.acceptRequestedData(outOfTurn,d->invalidWrites.incrementAndGet()),"unrequested future DATA is rejected");
+            TestSupport.check(invalidWrites.get()==0,"future DATA cannot reach the inbox");
+            TestSupport.check(sender.acceptRequest(request1)==1&&sender.retry(session).equals(data1),"duplicate request retains exact DATA ciphertext");
+            final var firstReceiver=receiver;
+            fails(()->firstReceiver.acceptRequestedData(data1,d->{throw new IOException("disk full");}),"failed persistence cannot acknowledge or request next");
+            TestSupport.check(receiver.retry(session).equals(request1)&&receiver.nextIndex(session)==1,"failed persistence keeps current request");
+            String request2=receiver.acceptRequestedData(data1,d->{});
+            receiver=ReliableTransferEngine.receiver("pair",key,new TransferSessionStore(receivePath));
+            TestSupport.check(receiver.acceptRequestedData(data1,d->{}).equals(request2),"duplicate DATA after restart replays current request");
+            receiveStore.clearFrame(session);
+            String rebuilt=receiver.resumePullReceiver();
+            TestSupport.check(ReliableTransferEngine.decode("pair",key,rebuilt).index()==2,"receiver reconstructs request after state/frame crash gap");
+            TestSupport.check(sender.acceptRequest(request2)==2,"request two confirms prepared first block");
+            String data2=sender.prepare(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.DATA,2,3,new byte[]{2}));
+            final var currentSender=sender;
+            fails(()->currentSender.acceptRequest(request1),"stale request cannot rewind sender");
+            String request3=receiver.acceptRequestedData(data2,d->{});
+            TestSupport.check(receiver.acceptRequestedData(data1,d->{}).equals(request3),"delayed old DATA cannot rewind receiver request");
+            sender=ReliableTransferEngine.sender("pair",key,new TransferSessionStore(sendPath));
+            TestSupport.check(sender.acceptRequest(request3)==3,"restarted sender advances only on next valid request");
+            String data3=sender.prepare(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.DATA,3,3,new byte[]{3}));
+            String finalAck=receiver.acceptRequestedData(data3,d->{});
+            TestSupport.check(ReliableTransferEngine.decode("pair",key,finalAck).type()==ReliableTransferEngine.Type.BLOCK_ACK&&receiver.nextIndex(session)==4,"final block persists before completion");
+            String retryFinal=receiver.resumePullReceiver();
+            TestSupport.check(ReliableTransferEngine.decode("pair",key,retryFinal).type()==request&&sender.acceptRequest(retryFinal)==3,"receiver requests final DATA again when completion/apply was interrupted");
+            sender.acceptBlockAck(finalAck);
+            TestSupport.check(sender.acceptRequest(retryFinal)==3,"legacy final ACK permits explicitly requested final DATA recovery before business receipt");
+            sender.prepare(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.DATA,3,3,new byte[]{3}));
+            receiver.acceptRequestedData(data3,d->{});
+            String completion=receiver.prepareCompletion(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,direction!=ReliableTransferEngine.Direction.HOST_TO_VM?ReliableTransferEngine.Type.BUSINESS_ACK:ReliableTransferEngine.Type.RECEIVED,0,3,new byte[0]));
+            if(direction!=ReliableTransferEngine.Direction.HOST_TO_VM)sender.acceptBusinessAck(completion,session,"repo","pull");else sender.acceptReceived(completion,session,"repo","pull");
+            TestSupport.check(ReliableTransferEngine.decode("pair",key,completion).type()!=ReliableTransferEngine.Type.BLOCK_ACK,"completion may replace final ACK after durable reception");
+            String fin=sender.prepareCompletion(new ReliableTransferEngine.Message(session,"repo","pull",kind,direction,ReliableTransferEngine.Type.FINAL,0,3,new byte[0]));
+            var restored=ReliableTransferEngine.sender("pair",key,new TransferSessionStore(sendPath));
+            if(direction!=ReliableTransferEngine.Direction.HOST_TO_VM)restored.acceptBusinessAck(completion,session,"repo","pull");else restored.acceptReceived(completion,session,"repo","pull");
+            TestSupport.check(restored.retry(session).equals(fin),"restored FINAL accepts duplicate receipt without clearing its ciphertext");
+        }
+
+    }
+
+    private static void sparseLegacyFileResumesPull(Path fixture)throws Exception {
+        byte[] key=new byte[32];String session=UUID.randomUUID().toString();
+        Path sendPath=java.nio.file.Files.createDirectory(fixture.resolve("legacy-pull-send")),receivePath=java.nio.file.Files.createDirectory(fixture.resolve("legacy-pull-receive"));
+        var sender=ReliableTransferEngine.sender("pair",key,new TransferSessionStore(sendPath));
+        var receiver=ReliableTransferEngine.receiver("pair",key,new TransferSessionStore(receivePath));
+        java.util.function.BiFunction<ReliableTransferEngine.Type,Integer,ReliableTransferEngine.Message> message=(type,index)->new ReliableTransferEngine.Message(session,"file","legacy-pull",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,type,index,5,type==ReliableTransferEngine.Type.DATA?new byte[]{index.byteValue()}:new byte[0]);
+        String invite=sender.prepare(message.apply(ReliableTransferEngine.Type.INVITE,0));
+        sender.acceptReady(receiver.acceptInviteAndReady(invite),session);
+        sender.prepare(message.apply(ReliableTransferEngine.Type.DATA,1));
+        sender.acceptBlockAck(ReliableTransferEngine.encode("pair",key,message.apply(ReliableTransferEngine.Type.BLOCK_ACK,1)));
+        String second=sender.prepare(message.apply(ReliableTransferEngine.Type.DATA,2));
+        sender.acceptBlockAck(receiver.acceptData(second,data->{}));
+        sender.prepare(message.apply(ReliableTransferEngine.Type.DATA,3));
+        sender.acceptMissing(ReliableTransferEngine.encode("pair",key,message.apply(ReliableTransferEngine.Type.MISSING,1)));
+        String first=sender.prepare(message.apply(ReliableTransferEngine.Type.DATA,1));
+        sender=ReliableTransferEngine.sender("pair",key,new TransferSessionStore(sendPath));
+        receiver=ReliableTransferEngine.receiver("pair",key,new TransferSessionStore(receivePath));
+        TestSupport.check(sender.acceptRequest(receiver.resumePullReceiver())==1,"legacy sparse receiver first requests missing block one");
+        String request3=receiver.acceptRequestedData(first,data->{});
+        TestSupport.check(ReliableTransferEngine.decode("pair",key,request3).index()==3,"saved sparse block two is not requested again");
+        var beforeAdvance=sender;
+        fails(()->beforeAdvance.acceptRequest(ReliableTransferEngine.encode("pair",key,message.apply(ReliableTransferEngine.Type.REQUEST,5))),"sparse request cannot confirm unprepared block four");
+        TestSupport.check(sender.acceptRequest(request3)==3,"prepared sparse prefix permits pull migration");
+        sender=ReliableTransferEngine.sender("pair",key,new TransferSessionStore(sendPath));
+        receiver=ReliableTransferEngine.receiver("pair",key,new TransferSessionStore(receivePath));
+        String third=sender.prepare(message.apply(ReliableTransferEngine.Type.DATA,3));
+        TestSupport.check(sender.acceptRequest(receiver.acceptRequestedData(third,data->{}))==4,"migration continues after restart");
+    }
+
     private static void unorderedFileBlocks(Path fixture)throws Exception{
         Path workspace=java.nio.file.Files.createDirectory(fixture.resolve("unordered-file"));
         byte[] key=new byte[32];String session=UUID.randomUUID().toString();
@@ -43,7 +136,9 @@ final class ReliableTransferTest {
     }
 
     static void run(Path fixture) throws Exception {
+        receiverDrivenRequests(fixture);
         unorderedFileBlocks(fixture);
+        sparseLegacyFileResumesPull(fixture);
         String session = UUID.randomUUID().toString();
         byte[] key = new byte[32]; java.util.Arrays.fill(key, (byte) 7);
         Path senderWorkspace = java.nio.file.Files.createDirectory(fixture.resolve("sender"));
@@ -118,18 +213,18 @@ final class ReliableTransferTest {
         ReliableTransferEngine receiver = ReliableTransferEngine.receiver(identity,key,new TransferSessionStore(receiverWorkspace));
         ReliableTransferEngine.Message invite = new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,
                 ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.INVITE,0,outgoing.metadata().count(),new byte[0]);
-        sender.acceptReady(receiver.acceptInviteAndReady(sender.prepare(invite)),session);
+        sender.acceptRequest(receiver.acceptPullInviteResult(sender.prepare(invite)).readyFrame());
         FileTransfer.Received[] received = new FileTransfer.Received[1];
         for(int index=1;index<=outgoing.metadata().count();index++){
             byte[] chunk=outgoing.chunks().get(index-1).getBytes(java.nio.charset.StandardCharsets.UTF_8);
             String data=sender.prepare(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,
                     ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.DATA,index,outgoing.metadata().count(),chunk));
-            String ack=receiver.acceptData(data,message->received[0]=FileTransfer.receive(receiverWorkspace,new String(message.payload(),java.nio.charset.StandardCharsets.UTF_8)));
+            String ack=receiver.acceptRequestedData(data,message->received[0]=FileTransfer.receive(receiverWorkspace,new String(message.payload(),java.nio.charset.StandardCharsets.UTF_8)));
             if(index<outgoing.metadata().count()){
                 FileTransfer.Received partial=received[0];
                 fails(()->FileReceiveConfirmation.confirmVerified(receiverWorkspace,session,fileId,partial,identity,key),
                         "partial file cannot claim verified reception");
-                sender.acceptBlockAck(ack);
+                sender.acceptRequest(ack);
             }
         }
         TestSupport.check(received[0]!=null&&received[0].complete(),"encrypted FILE blocks reassemble through existing binary inbox");
@@ -175,7 +270,7 @@ final class ReliableTransferTest {
         ReliableTransferEngine.Message invite = new ReliableTransferEngine.Message(outerSession, "repo", innerSession,
                 ReliableTransferEngine.Kind.PROJECT, ReliableTransferEngine.Direction.HOST_TO_VM,
                 ReliableTransferEngine.Type.INVITE, 0, blocks.size(), new byte[0]);
-        sender.acceptReady(receiver.acceptInviteAndReady(sender.prepare(invite)), outerSession);
+        sender.acceptRequest(receiver.acceptPullInviteResult(sender.prepare(invite)).readyFrame());
         Model.Payload[] completed = new Model.Payload[1];
         ProjectTransferService service = new ProjectTransferService(workspace, config);
         List<String> sendBlocks=blocks;
@@ -191,9 +286,9 @@ final class ReliableTransferTest {
                         new String(incoming.payload(), java.nio.charset.StandardCharsets.UTF_8));
                 if (received.payload() != null) completed[0] = received.payload();
             };
-            String ack = receiver.acceptData(frame, inbox);
-            if (index == 1) TestSupport.check(ack.equals(receiver.acceptData(frame, inbox)), "inbox duplicate returns same durable ACK");
-            TestSupport.check(sender.acceptBlockAck(ack) == current, "inbox ACK follows durable block persistence");
+            String ack = receiver.acceptRequestedData(frame, inbox);
+            if (index == 1) TestSupport.check(ack.equals(receiver.acceptRequestedData(frame, inbox)), "inbox duplicate returns same durable ACK");
+            if(index<blocks.size())TestSupport.check(sender.acceptRequest(ack)==current+1,"next request follows durable block persistence");
             if(index==1){sender=ReliableTransferEngine.sender("pair",key,new TransferSessionStore(senderWorkspace));sendBlocks=sourceStore.loadParts(outerSession,innerSession,blocks.size());TestSupport.check(sendBlocks.equals(blocks),"restarted HOST sender replays remaining original chunks byte-for-byte");}
         }
         TestSupport.check(completed[0] != null && java.util.Arrays.equals(content, completed[0].entries().getFirst().data()),

@@ -38,6 +38,8 @@ public final class CoreTest {
     }
     private static void configuration()throws Exception{
         Config c=config(Role.HOST,temp.resolve("vm"));check(c.projects().size()==2,"multiple project mappings");check(Config.parse(c.yaml()).equals(c),"configuration round trip");
+        String legacy=c.yaml().replaceAll("(?m)^  focus-delay-ms:.*\\R?","");check(Config.parse(legacy).focusDelayMs()==300,"legacy config defaults to 300 ms");Config delayed=Config.parse(legacy+"  focus-delay-ms: 750\n");check(delayed.yaml().contains("focus-delay-ms: 750")&&Config.parse(delayed.yaml()).equals(delayed),"focus delay persists across configuration round trip");
+        fails("focus delay too small","focus-delay-ms",()->Config.parse(legacy+"  focus-delay-ms: 0\n"));fails("duplicate focus delay rejected","重复",()->Config.parse(legacy+"  focus-delay-ms: 300\n  focus-delay-ms: 400\n"));
         check(c.excluded("module/target/X.class")&&c.excluded("a/debug.log")&&!c.excluded("src/X.java"),"recursive directory and filename exclusions");
         check(c.excluded(".git/config")&&c.excluded(".vmsync/config.yaml"),"mandatory state/Git exclusions");
         check(Config.parse(c.yaml().replace("projects/ri-core","services/ri-core")).project("ri-core").local().equals("services/ri-core"),"HOST directory name and depth unrestricted");

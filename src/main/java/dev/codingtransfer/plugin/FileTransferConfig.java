@@ -30,7 +30,7 @@ final class FileTransferConfig {
     }
     static void saveChunkSize(Path workspace,int chunkKb)throws IOException {
         Config current=forSettings(workspace);
-        Config updated=new Config(current.role(),current.projects(),current.exclude(),chunkKb,current.git(),current.identity());
+        Config updated=new Config(current.role(),current.projects(),current.exclude(),chunkKb,current.git(),current.identity(),current.focusDelayMs());
         saveIfConfirmed(workspace,Config.parse(updated.yaml()),true);
     }
 

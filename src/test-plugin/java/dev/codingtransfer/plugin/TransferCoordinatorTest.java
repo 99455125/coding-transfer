@@ -15,13 +15,17 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class TransferCoordinatorTest {
     private TransferCoordinatorTest() {}
     public static void main(String[] args) throws Exception {
+        terminalRecoversAuthenticatedOldSessionFrame();
+        receiverOwnsRetries();
         handlerFailureActuallyPauses();
         fixedClockSlotsAndPeerProtection();
+        delayedOwnEchoDoesNotStrandCurrentBlock();
         ownSlotWaitsWithoutRewriting();
         onlyUnprocessableFramesCanBeRecovered();
         pendingResponseRecoversFromInvalidPeer();
-        hostInputPulseIsOncePerFrameAndStopsWithSession();
-        busyReadStillAllowsInputAssist();
+        configuredFocusDelayStartsAfterWrite();
+        hostFocusPulseIsOncePerFrameAndStopsWithSession();
+        busyReadStillAllowsFocusAssist();
         retryRechecksClipboardAfterInput();
         retryUsesRevisionWithoutRereadingPayload();
         statusHistoryCoalescesStructuredEventsAndRejectsStaleSessions();
@@ -40,6 +44,53 @@ public final class TransferCoordinatorTest {
         restoredPublishFailureKeepsNativeStartupDetails();
         restoredFramesKeepTheirProtocolPhaseStatus();
         System.out.println("PASS coordinator terminal release, immediate verified-file ACK, and lost-frame recovery checks");
+    }
+
+    private static void terminalRecoversAuthenticatedOldSessionFrame()throws Exception {
+        for(String staleType:List.of("DATA","REQUEST","OTHER_SESSION","USER_TEXT")) {
+            Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();
+            byte[] key=new byte[32];String session=java.util.UUID.randomUUID().toString();
+            String fin=ReliableTransferEngine.encode("pair",key,new ReliableTransferEngine.Message(session,"file","one",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.FINAL,0,1,new byte[0]));
+            String ack=ReliableTransferEngine.encode("pair",key,new ReliableTransferEngine.Message(session,"file","one",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.FINAL_ACK,0,1,new byte[0]));
+            TransferCoordinator.FrameDescriber describe=frame->{var m=ReliableTransferEngine.decode("pair",key,frame);return new TransferCoordinator.FrameInfo(m.session(),m.type().name(),m.index(),m.total());};
+            TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
+            coordinator.startReceive(new Object(),"pair",frame->new TransferCoordinator.Outcome(ack,"done",true),listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"FILE_RECEIVER","terminal",describe));
+            clipboard.write(fin);scheduler.runAll();
+            String stale=staleType.equals("USER_TEXT")?"ordinary text":ReliableTransferEngine.encode("pair",key,new ReliableTransferEngine.Message(staleType.equals("OTHER_SESSION")?java.util.UUID.randomUUID().toString():session,"file","one",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,staleType.equals("REQUEST")?ReliableTransferEngine.Type.REQUEST:ReliableTransferEngine.Type.DATA,1,1,staleType.equals("REQUEST")?new byte[0]:new byte[]{1}));
+            clipboard.write(stale);clock.advance(10000);scheduler.runAll();
+            check(clipboard.read().equals(staleType.equals("DATA")||staleType.equals("REQUEST")?ack:stale),"terminal retry recovers old session frames and preserves foreign content: "+staleType);
+            coordinator.dispose();scheduler.shutdownNow();
+        }
+    }
+
+    private static void receiverOwnsRetries() {
+        for(String phase:List.of("WAIT_BUSINESS_CONFIRMATION","WAIT_FILE_VERIFIED")) {
+            Clock legacyClock=new Clock();Clipboard legacyClipboard=new Clipboard();ManualScheduler legacyScheduler=new ManualScheduler();
+            TransferCoordinator legacy=new TransferCoordinator(legacyClipboard,Runnable::run,()->legacyClock.now,legacyScheduler);
+            legacy.startSend(new Object(),"pair","pair INVITE",frame->frame.equals("pair FINAL_BLOCK_ACK")?new TransferCoordinator.Outcome(null,"waiting receipt",false).phase(phase):new TransferCoordinator.Outcome("pair DATA_LAST","data",false).retrying("WAIT_ACK_DATA_3"),listener(new AtomicInteger(),new AtomicInteger()));
+            legacyClipboard.write("pair READY");legacyScheduler.runAll();legacyClipboard.write("pair FINAL_BLOCK_ACK");legacyScheduler.runAll();legacyClipboard.write("pair DATA_LAST");int legacyWrites=legacyClipboard.writes;
+            legacyClock.advance(10000);legacyScheduler.runAll();
+            check(legacyClipboard.writes==legacyWrites,"legacy final ACK transitions to passive receipt wait: "+phase);
+            legacy.dispose();legacyScheduler.shutdownNow();
+        }
+        Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();
+        final Clock senderClock=clock;
+        TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->senderClock.now,scheduler);
+        coordinator.startReceive(new Object(),"pair",frame->new TransferCoordinator.Outcome("pair DATA1","response",false).retrying("WAIT_ACK_DATA_1"),listener(new AtomicInteger(),new AtomicInteger()));
+        clipboard.write("pair REQUEST1");scheduler.runAll();int writes=clipboard.writes;
+        for(int i=0;i<30;i++){clock.advance(1000);scheduler.runAll();}
+        check(clipboard.writes==writes,"DATA must never retry autonomously even when a legacy outcome enables retry");
+        clipboard.write("foreign");writes=clipboard.writes;clock.advance(10000);scheduler.runAll();
+        check(clipboard.writes==writes,"foreign clipboard content cannot trigger autonomous DATA publication");
+        coordinator.dispose();scheduler.shutdownNow();
+        clock=new Clock();clipboard=new Clipboard();scheduler=new ManualScheduler();final Clock receiverClock=clock;
+        coordinator=new TransferCoordinator(clipboard,Runnable::run,()->receiverClock.now,scheduler);
+        coordinator.startReceive(new Object(),"pair",frame->new TransferCoordinator.Outcome("pair REQUEST1","request",false).retrying("WAIT_DATA_1"),listener(new AtomicInteger(),new AtomicInteger()));
+        clipboard.write("pair INVITE");scheduler.runAll();writes=clipboard.writes;
+        clock.advance(10000);scheduler.runAll();check(clipboard.writes==writes+1,"receiver retries compact first request on a relative timeout");
+        clipboard.write("pair INVITE");scheduler.runAll();writes=clipboard.writes;
+        clock.advance(10000);scheduler.runAll();check(clipboard.writes==writes+1,"duplicate invite replay must not disable request retries");
+        coordinator.dispose();scheduler.shutdownNow();
     }
 
     private static void handlerFailureActuallyPauses(){
@@ -63,65 +114,62 @@ public final class TransferCoordinatorTest {
     }
 
     private static void fixedClockSlotsAndPeerProtection(){
-        for(boolean ack:List.of(false,true)){
-            Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();AtomicInteger paused=new AtomicInteger(),handled=new AtomicInteger();
+        for(long offset:List.of(0L,59_000L,1_234_567L)){
+            Clock clock=new Clock();clock.now=offset;Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();AtomicInteger paused=new AtomicInteger(),handled=new AtomicInteger();
             TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
-            coordinator.startReceive(new Object(),"pair",f->{handled.incrementAndGet();return new TransferCoordinator.Outcome(ack?"pair ACK1":"pair DATA1","waiting",false).phase(ack?"WAIT_DATA_2":"WAIT_ACK_DATA_1");},listener(new AtomicInteger(),paused));
-            clipboard.write("pair PEER");scheduler.runAll();int previous=clipboard.writes;
-            int attempts=0;
-            for(int second=1;second<=40;second++){
-                clock.advance(1000);scheduler.runAll();boolean due=ack?(second%10==4||second%10==8):(second%10==1||second%10==6);
-                check(clipboard.writes==previous+(due?1:0),"only role-specific wall-clock slots may publish: "+ack+" at "+second);
-                if(due)attempts++;previous=clipboard.writes;scheduler.runAll();check(clipboard.writes==previous,"one publication per absolute second");
+            coordinator.startReceive(new Object(),"pair",f->{handled.incrementAndGet();return new TransferCoordinator.Outcome("pair REQUEST2","waiting",false).retrying("WAIT_DATA_2");},listener(new AtomicInteger(),paused));
+            clipboard.write("pair DATA1");scheduler.runAll();int previous=clipboard.writes;
+            for(int second=1;second<=80;second++){
+                clock.advance(1000);scheduler.runAll();boolean due=second%10==0;
+                check(clipboard.writes==previous+(due?1:0),"only receiver timeout may publish at "+second+" offset "+offset);
+                previous=clipboard.writes;scheduler.runAll();check(clipboard.writes==previous,"no duplicate timeout publication");
             }
-            check(attempts==8,"eight bounded wall-clock attempts");
-            clock.advance(10000);scheduler.runAll();check(paused.get()==1,"exhausted attempts preserve a response window before pausing");
-            check(handled.get()==1,"refresh does not repeat business processing");coordinator.dispose();scheduler.shutdownNow();
+            clock.advance(10000);scheduler.runAll();check(paused.get()==1,"eight request retries preserve final response window before pause");
+            check(handled.get()==1,"request retries do not repeat business processing");coordinator.dispose();scheduler.shutdownNow();
         }
-        for(boolean ack:List.of(false,true)){
-            Clock clock=new Clock();clock.now=59_000;Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();
-            TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
-            coordinator.startReceive(new Object(),"pair",f->new TransferCoordinator.Outcome(ack?"pair ACK1":"pair DATA1","waiting",false).phase(ack?"WAIT_DATA_2":"WAIT_ACK_DATA_1"),listener(new AtomicInteger(),new AtomicInteger()));
-            clipboard.write("pair PEER");scheduler.runAll();int before=clipboard.writes;
-            clock.now=ack?64_000:61_000;scheduler.runAll();check(clipboard.writes==before+1,"wall clock slots survive minute rollover");
-            clock.now-=10_000;scheduler.runAll();check(clipboard.writes==before+1,"backward clock adjustment never repeats an older slot");
-            coordinator.dispose();scheduler.shutdownNow();
-        }
-        for(String race:List.of("peer","slot_expired","recent")){
-            Clock clock=new Clock();clock.now=500;AtomicInteger reads=new AtomicInteger();
+        for(String race:List.of("peer","revision")){
+            Clock clock=new Clock();AtomicInteger reads=new AtomicInteger();
             Clipboard clipboard=new Clipboard(){@Override public String read(){
-                if(clock.now==6000&&reads.incrementAndGet()==2){if(race.equals("peer")){value="pair ACK1";revision++;}else if(race.equals("slot_expired"))clock.now=7000;}
+                if(clock.now==10000&&reads.incrementAndGet()==2){if(race.equals("peer"))value="pair DATA2";revision++;}
                 return value;
             }};
             ManualScheduler scheduler=new ManualScheduler();TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
-            coordinator.startReceive(new Object(),"pair",f->new TransferCoordinator.Outcome("pair DATA1","waiting",false).phase("WAIT_ACK_DATA_1"),listener(new AtomicInteger(),new AtomicInteger()));
-            clipboard.write("pair READY");scheduler.runAll();int before=clipboard.writes;
-            clock.now=1000;scheduler.runAll();check(clipboard.writes==before,"fresh publication skips adjacent slot");
-            if(!race.equals("recent")){clock.now=6000;scheduler.runAll();check(clipboard.writes==before,"new peer or expired slot prevents refresh");}
+            coordinator.startReceive(new Object(),"pair",f->new TransferCoordinator.Outcome("pair REQUEST2","waiting",false).retrying("WAIT_DATA_2"),listener(new AtomicInteger(),new AtomicInteger()));
+            clipboard.write("pair DATA1");scheduler.runAll();int before=clipboard.writes;
+            clock.now=10000;scheduler.runAll();check(clipboard.writes==before,"new peer or revision change prevents request retry: "+race);
             coordinator.dispose();scheduler.shutdownNow();
         }
-        Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();AtomicInteger persisted=new AtomicInteger();
-        TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
-        coordinator.startReceive(new Object(),"pair",f->{persisted.incrementAndGet();return new TransferCoordinator.Outcome("pair ACK1","received",false).phase("WAIT_DATA_2");},listener(new AtomicInteger(),new AtomicInteger()));
-        clipboard.write("pair DATA1");scheduler.runAll();clock.now=2500;clipboard.write("pair DATA1");scheduler.runAll();
-        check(clipboard.read().equals("pair ACK1")&&persisted.get()==1,"duplicate DATA immediately replays ACK outside timed slots");
-        coordinator.dispose();scheduler.shutdownNow();
     }
 
     private static void ownSlotWaitsWithoutRewriting(){
         Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();List<Boolean> keys=new ArrayList<>();
-        TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,left->{keys.add(left);return "sent";});
+        TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,()->{keys.add(true);return "switched";});
         Object owner=new Object();
         coordinator.startSend(owner,"pair","pair DATA",f->null,listener(new AtomicInteger(),new AtomicInteger()),
-            new TransferCoordinator.LogContext(null,"TEST","host",f->new TransferCoordinator.FrameInfo("session","CONTROL",0,1),()->false,true));
+            new TransferCoordinator.LogContext(null,"TEST","host",f->new TransferCoordinator.FrameInfo("session","CONTROL",0,1),()->false,true,1000));
         for(int i=0;i<6;i++){clock.advance(1000);scheduler.runAll();}
         check(clipboard.writes==1,"our current slot must never be periodically rewritten");
-        check(keys.equals(List.of(true,false,true,false,true,false)),"waiting pulses alternate without rewriting");
+        check(keys.size()==2,"one-second first switch and three-second observation do not rewrite clipboard");
         clipboard.write("foreign content");int writes=clipboard.writes;clock.advance(10000);scheduler.runAll();
-        check(clipboard.writes==writes+1&&clipboard.read().equals("pair DATA"),"unprocessable foreign slot permits recovery");
+        check(clipboard.writes==writes+1&&clipboard.read().equals("pair DATA"),"bootstrap recovery handles an unprocessable slot");
         coordinator.awaitUserAction(owner,"save");clipboard.write("ordinary");clock.advance(5000);scheduler.runAll();
         check(clipboard.read().equals("ordinary"),"manual action wait never overwrites");
         coordinator.dispose();scheduler.shutdownNow();
+    }
+
+    private static void delayedOwnEchoDoesNotStrandCurrentBlock(){
+        Clock clock=new Clock();AtomicInteger arrivalRead=new AtomicInteger(-1);
+        Clipboard clipboard=new Clipboard(){@Override public String read(){if(arrivalRead.get()>0&&arrivalRead.decrementAndGet()==0){value="pair NEW_PEER";revision++;}return super.read();}};
+        ManualScheduler scheduler=new ManualScheduler();AtomicInteger handled=new AtomicInteger();
+        String stale="pair REQUEST1",current="pair REQUEST2";
+        TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
+        coordinator.startReceive(new Object(),"pair",frame->{if(frame.equals(stale))throw new TransferCoordinator.OwnFrame();handled.incrementAndGet();return new TransferCoordinator.Outcome(current,"waiting",false).retrying("WAIT_DATA_2");},listener(new AtomicInteger(),new AtomicInteger()));
+        clipboard.write("pair PEER");scheduler.runAll();clock.now=500;clipboard.write(stale);scheduler.runAll();int writes=clipboard.writes;
+        clock.now=10000;scheduler.runAll();check(clipboard.writes==writes+1&&clipboard.read().equals(current),"delayed request echo recovers the current request");
+        check(handled.get()==1,"recovering an old request never repeats business processing");
+        clipboard.write(stale);writes=clipboard.writes;arrivalRead.set(2);clock.now=20000;scheduler.runAll();
+        check(clipboard.writes==writes&&clipboard.read().equals("pair NEW_PEER"),"newer DATA arriving during reread survives request retry");
+        scheduler.runAll();check(handled.get()==2,"new peer processed next poll");coordinator.dispose();scheduler.shutdownNow();
     }
 
     private static void onlyUnprocessableFramesCanBeRecovered(){
@@ -261,29 +309,45 @@ public final class TransferCoordinatorTest {
     }
 
     private static void delayedRdpBridgeReproducesHandshakeInterruption() throws Exception {
+        for(long[] delays:new long[][]{{3000,5000},{1000,2000},{5000,3000},{7000,7000}})
+            delayedRdpBridge(delays[0],delays[1]);
+    }
+
+    private static void delayedRdpBridge(long senderDelay,long receiverDelay) throws Exception {
         Clock clock=new Clock();DelayedBridge bridge=new DelayedBridge(clock);EndpointClipboard senderClipboard=bridge.sender(),receiverClipboard=bridge.receiver();
+        bridge.senderDelay=senderDelay;bridge.receiverDelay=receiverDelay;
         ManualScheduler senderScheduler=new ManualScheduler(),receiverScheduler=new ManualScheduler();
         TransferCoordinator sender=new TransferCoordinator(senderClipboard,Runnable::run,()->clock.now,senderScheduler);
         TransferCoordinator receiver=new TransferCoordinator(receiverClipboard,Runnable::run,()->clock.now,receiverScheduler);
         PathPair paths=new PathPair(java.nio.file.Files.createTempDirectory("rdp-sender-"),java.nio.file.Files.createTempDirectory("rdp-receiver-"));
         byte[] key=new byte[32];java.util.Arrays.fill(key,(byte)23);String identity="rdp",session=java.util.UUID.randomUUID().toString();int total=3;
+        java.util.Set<String> dropped=new java.util.HashSet<>();
+        bridge.drop=frame->{try{return dropped.add(ReliableTransferEngine.decode(identity,key,frame).type().name());}catch(Exception invalid){return false;}};
         ReliableTransferEngine tx=ReliableTransferEngine.sender(identity,key,new TransferSessionStore(paths.sender));
         ReliableTransferEngine rx=ReliableTransferEngine.receiver(identity,key,new TransferSessionStore(paths.receiver));
         String invite=tx.prepare(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.INVITE,0,total,new byte[0]));
         int[] counts=new int[5];java.util.List<Integer> sent=new java.util.ArrayList<>();String[] data={null};java.util.Set<Integer> durable=new java.util.HashSet<>();
-        sender.startSend(new Object(),identity,invite,frame->{ReliableTransferEngine.Message m=ReliableTransferEngine.decode(identity,key,frame);switch(m.type()){
-            case READY->{counts[0]++;var result=tx.acceptReadyResult(frame,session);if(result.disposition()==ReliableTransferEngine.ReadyDisposition.DUPLICATE)return new TransferCoordinator.Outcome(null,"duplicate READY ignored",false).phase("WAIT_ACK_DATA_"+result.awaitingDataIndex());data[0]=tx.prepare(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.DATA,1,total,new byte[]{1}));sent.add(1);return new TransferCoordinator.Outcome(data[0],"data 1",false).retrying("WAIT_ACK_DATA_1");}
-            case BLOCK_ACK->{counts[1]++;var result=tx.acceptBlockAckResult(frame);if(result.disposition()==ReliableTransferEngine.AckDisposition.DUPLICATE)return new TransferCoordinator.Outcome(null,"duplicate ACK ignored",false).phase("WAIT_ACK_DATA_"+(result.nextIndex()-1));if(result.nextIndex()<=total){int i=result.nextIndex();data[0]=tx.prepare(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.DATA,i,total,new byte[]{(byte)i}));sent.add(i);return new TransferCoordinator.Outcome(data[0],"data "+i,false).retrying("WAIT_ACK_DATA_"+i);}return new TransferCoordinator.Outcome(null,"all blocks acknowledged",false,true);}
-            default->throw new java.io.IOException("unexpected sender frame "+m.type());
-        }},listener(new AtomicInteger(),new AtomicInteger()));
-        receiver.startReceive(new Object(),identity,frame->{ReliableTransferEngine.Message m=ReliableTransferEngine.decode(identity,key,frame);switch(m.type()){
-            case INVITE->{counts[2]++;var result=rx.acceptInviteResult(frame);if(result.readyFrame()==null)return new TransferCoordinator.Outcome(null,"late duplicate invite ignored",false).phase("WAIT_DATA");return new TransferCoordinator.Outcome(result.readyFrame(),"ready",false).replayable("WAIT_DATA_1");}
-            case DATA->{counts[3]++;String ack=rx.acceptData(frame,block->durable.add(block.index()));return new TransferCoordinator.Outcome(ack,"persisted",false).replayable("WAIT_DATA_"+(m.index()+1));}
-            default->throw new java.io.IOException("unexpected receiver frame "+m.type());
-        }},listener(new AtomicInteger(),new AtomicInteger()));
-        for(int i=0;i<300;i++){clock.advance(400);bridge.deliver();senderScheduler.runAll();receiverScheduler.runAll();bridge.deliver();}
-        check(counts[3]>=3&&durable.equals(java.util.Set.of(1,2,3)),"delayed bridge durably delivers all three stop-and-wait blocks");
-        check(sent.equals(java.util.List.of(1,2,3))&&tx.nextIndex(session)==4,"sender cursor advances once per ordered ACK and never sends n+1 early");
+        TransferCoordinator.FrameDescriber describe=frame->{var m=ReliableTransferEngine.decode(identity,key,frame);return new TransferCoordinator.FrameInfo(m.session(),m.type().name(),m.index(),m.total());};
+        sender.startSend(new Object(),identity,invite,frame->{var m=ReliableTransferEngine.decode(identity,key,frame);switch(m.type()){
+            case REQUEST->{int i=tx.acceptRequest(frame);data[0]=tx.prepare(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.DATA,i,total,new byte[]{(byte)i}));if(!sent.contains(i))sent.add(i);return new TransferCoordinator.Outcome(data[0],"data "+i,false).phase("WAIT_ACK_DATA_"+i);}
+            case BUSINESS_ACK->{tx.acceptBusinessAck(frame,session,"file","one-file");return new TransferCoordinator.Outcome(tx.prepareCompletion(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.FINAL,0,total,new byte[0])),"final",false).phase("WAIT_FINAL_ACK");}
+            case FINAL_ACK-> {return new TransferCoordinator.Outcome(null,"done",true);}
+            case DATA,INVITE,FINAL->throw new TransferCoordinator.OwnFrame();
+            default->throw new TransferCoordinator.UnprocessableFrame("unexpected sender frame "+m.type());
+        }},listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"FILE_SENDER","send",describe));
+        String[] completion={null};
+        receiver.startReceive(new Object(),identity,frame->{var m=ReliableTransferEngine.decode(identity,key,frame);switch(m.type()){
+            case INVITE->{counts[2]++;var result=rx.acceptPullInviteResult(frame);if(result.readyFrame()==null)return new TransferCoordinator.Outcome(null,"late invite",false);return new TransferCoordinator.Outcome(result.readyFrame(),"request",false).retrying("WAIT_DATA_"+ReliableTransferEngine.decode(identity,key,result.readyFrame()).index());}
+            case DATA->{counts[3]++;if(completion[0]!=null)return new TransferCoordinator.Outcome(completion[0],"receipt",false).retrying("WAIT_FINAL");String response=rx.acceptRequestedData(frame,block->durable.add(block.index()));if(durable.size()==total){completion[0]=rx.prepareCompletion(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.BUSINESS_ACK,0,total,new byte[0]));return new TransferCoordinator.Outcome(completion[0],"receipt",false).retrying("WAIT_FINAL");}return new TransferCoordinator.Outcome(response,"request",false).retrying("WAIT_DATA_"+ReliableTransferEngine.decode(identity,key,response).index());}
+            case FINAL->{return new TransferCoordinator.Outcome(rx.prepareCompletion(new ReliableTransferEngine.Message(session,"file","one-file",ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.FINAL_ACK,0,total,new byte[0])),"done",true);}
+            case REQUEST,BUSINESS_ACK,BLOCK_ACK,FINAL_ACK->throw new TransferCoordinator.OwnFrame();
+            default->throw new TransferCoordinator.UnprocessableFrame("unexpected receiver frame "+m.type());
+        }},listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"FILE_RECEIVER","receive",describe));
+        for(int i=0;i<900&&(sender.hasActiveTransfer()||receiver.hasActiveTransfer());i++){clock.advance(400);bridge.deliver();senderScheduler.runAll();receiverScheduler.runAll();bridge.deliver();}
+        check(dropped.containsAll(java.util.Set.of("INVITE","REQUEST","DATA","BUSINESS_ACK","FINAL","FINAL_ACK")),"lost-frame probe covers bootstrap, block and every completion stage");
+        check(counts[3]>=3&&durable.equals(java.util.Set.of(1,2,3)),"delayed bridge durably delivers all blocks at "+senderDelay+"/"+receiverDelay+" ms");
+        check(sent.equals(java.util.List.of(1,2,3))&&tx.nextIndex(session)==4,"sender cursor advances once per receiver request at "+senderDelay+"/"+receiverDelay+" ms");
+        check(!sender.hasActiveTransfer()&&!receiver.hasActiveTransfer(),"pull completion survives delayed transport at "+senderDelay+"/"+receiverDelay);
         sender.dispose();receiver.dispose();senderScheduler.shutdownNow();receiverScheduler.shutdownNow();deleteTree(paths.sender);deleteTree(paths.receiver);
     }
 
@@ -295,6 +359,8 @@ public final class TransferCoordinatorTest {
         clipboard.write("pair FINAL");scheduler.runAll();
         check(!coordinator.hasActiveTransfer()&&successes.get()==1&&pending.get()==0,"successful receiver releases UI lease immediately");
         check(clipboard.read().equals("pair FINAL_ACK"),"initial terminal response is retained on clipboard");
+        int terminalWrites=clipboard.writes;clock.advance(10000);scheduler.runAll();
+        check(clipboard.writes==terminalWrites+1&&!coordinator.hasActiveTransfer(),"receiver retries lost final confirmation without retaining UI ownership");
         clipboard.write("");clock.advance(2_100);scheduler.runAll();
         check(clipboard.read().isEmpty(),"blank clipboard is not treated as a duplicate FINAL");
         clipboard.write("pair FINAL");clock.advance(2_100);scheduler.runAll();
@@ -324,15 +390,15 @@ public final class TransferCoordinatorTest {
         String inviteFrame=vm.prepare(invite);
         String[] dataFrame={null},businessAck={null};
         TransferCoordinator.FrameHandler senderHandler=frame->{ReliableTransferEngine.Message m=ReliableTransferEngine.decode(identity,key,frame);return switch(m.type()){
-            case READY->{vm.acceptReady(frame,session);dataFrame[0]=vm.prepare(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.DATA,1,total,new byte[]{4,5,6}));yield new TransferCoordinator.Outcome(dataFrame[0],"sending final block",false);}
+            case REQUEST->{vm.acceptRequest(frame);dataFrame[0]=vm.prepare(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.DATA,1,total,new byte[]{4,5,6}));yield new TransferCoordinator.Outcome(dataFrame[0],"sending final block",false);}
             case BLOCK_ACK->{vm.acceptBlockAck(frame);yield new TransferCoordinator.Outcome(null,"waiting for receiver verification",false);}
             case BUSINESS_ACK->{vm.acceptBusinessAck(frame,session,"file",fileId);yield new TransferCoordinator.Outcome(vm.prepareCompletion(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.FINAL,0,total,new byte[0])),"receiver verified",false);}
             case FINAL_ACK->new TransferCoordinator.Outcome(null,"transfer complete",true);
             default->throw new IllegalStateException(m.type().toString());
         };};
         TransferCoordinator.FrameHandler receiverHandler=frame->{ReliableTransferEngine.Message m=ReliableTransferEngine.decode(identity,key,frame);return switch(m.type()){
-            case INVITE->new TransferCoordinator.Outcome(host.acceptInviteAndReady(frame),"ready",false).replayable("WAIT_DATA_1");
-            case DATA->{if(businessAck[0]!=null)yield new TransferCoordinator.Outcome(businessAck[0],"replayed verified reception",false).retrying("WAIT_FINAL_ACK").replayable("WAIT_FINAL_ACK");host.acceptData(frame,data->persisted.add(m.session()+":"+m.index()));businessAck[0]=host.prepareCompletion(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.BUSINESS_ACK,0,total,new byte[]{1}));yield new TransferCoordinator.Outcome(businessAck[0],"verified reception",false).retrying("WAIT_FINAL_ACK").replayable("WAIT_FINAL_ACK");}
+            case INVITE->new TransferCoordinator.Outcome(host.acceptPullInviteResult(frame).readyFrame(),"request",false).retrying("WAIT_DATA_1");
+            case DATA->{if(businessAck[0]!=null)yield new TransferCoordinator.Outcome(businessAck[0],"replayed verified reception",false).retrying("WAIT_FINAL").replayable("WAIT_FINAL");host.acceptRequestedData(frame,data->persisted.add(m.session()+":"+m.index()));businessAck[0]=host.prepareCompletion(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.BUSINESS_ACK,0,total,new byte[]{1}));yield new TransferCoordinator.Outcome(businessAck[0],"verified reception",false).retrying("WAIT_FINAL").replayable("WAIT_FINAL");}
             case FINAL->{String ack=host.prepareCompletion(new ReliableTransferEngine.Message(session,"file",fileId,ReliableTransferEngine.Kind.FILE,ReliableTransferEngine.Direction.FILE,ReliableTransferEngine.Type.FINAL_ACK,0,total,new byte[0]));yield new TransferCoordinator.Outcome(ack,"received file complete",true);}
             default->throw new IllegalStateException(m.type().toString());
         };};
@@ -421,6 +487,14 @@ public final class TransferCoordinatorTest {
     }
 
     private static void restoredFramesKeepTheirProtocolPhaseStatus() {
+        for(String type:List.of("DATA","FINAL")) {
+            Clock clock=new Clock();Clipboard clipboard=new Clipboard();clipboard.write("user text");ManualScheduler scheduler=new ManualScheduler();
+            TransferCoordinator coordinator=new TransferCoordinator(clipboard,Runnable::run,()->clock.now,scheduler);
+            coordinator.continueConfirmation(new Object(),"pair","pair "+type,frame->new TransferCoordinator.Outcome(null,"unused",false),listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"FILE_SENDER","restore",frame->new TransferCoordinator.FrameInfo(null,type,1,3)));
+            int writes=clipboard.writes;clock.advance(120000);scheduler.runAll();check(clipboard.writes==writes&&clipboard.read().equals("user text"),"restored sender waits passively for receiver: "+type);
+            coordinator.dispose();scheduler.shutdownNow();
+        }
+        assertRestoredStatus("pair REQUEST_2","REQUEST",2,"WAIT_DATA_2","等待第 2 块");
         assertRestoredStatus("pair DATA_2","DATA",2,"WAIT_ACK_DATA_2","等待第 2 块确认");
         assertRestoredStatus("pair BLOCK_ACK_3","BLOCK_ACK",3,"WAIT_DATA_COMPLETION","已接收 3 / 3 块");
         assertRestoredStatus("pair BLOCK_ACK_2","BLOCK_ACK",2,"WAIT_DATA_3","等待第 3 块");
@@ -454,41 +528,54 @@ public final class TransferCoordinatorTest {
     private static void check(boolean condition,String message){if(!condition)throw new AssertionError(message);}
     private static void deleteTree(java.nio.file.Path root)throws Exception{try(var paths=java.nio.file.Files.walk(root)){for(java.nio.file.Path path:paths.sorted(java.util.Comparator.reverseOrder()).toList())java.nio.file.Files.delete(path);}}
     private static final class Clock {long now;void advance(long millis){now+=millis;}}
-    private static void hostInputPulseIsOncePerFrameAndStopsWithSession(){
-        Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();AtomicInteger pulses=new AtomicInteger();List<Boolean> directions=new ArrayList<>();
-        TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,left->{directions.add(left);pulses.incrementAndGet();return "sent";});
-        TransferCoordinator.LogContext context=new TransferCoordinator.LogContext(null,"FILE_SENDER","ui",f->new TransferCoordinator.FrameInfo("session","INVITE",0,21),()->false,true);
+    private static void configuredFocusDelayStartsAfterWrite(){
+        for(int delay:new int[]{300,750}){
+            Clock clock=new Clock();ManualScheduler scheduler=new ManualScheduler();AtomicInteger pulses=new AtomicInteger();
+            Clipboard clipboard=new Clipboard(){@Override public void write(String value){super.write(value);clock.advance(25);}};
+            TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,()->{pulses.incrementAndGet();return "switched";});
+            Object owner=new Object();coordinator.startSend(owner,"pair","pair DATA",f->null,listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"TEST","configured",f->null,()->false,true,delay));
+            clock.advance(delay-1);scheduler.runAll();check(pulses.get()==0,"configured delay starts after successful write returns");clock.advance(1);scheduler.runAll();check(pulses.get()==1,"configured focus delay reaches coordinator");
+            coordinator.endSession(owner);coordinator.dispose();scheduler.shutdownNow();
+        }
+    }
+    private static void hostFocusPulseIsOncePerFrameAndStopsWithSession(){
+        Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();AtomicInteger pulses=new AtomicInteger();
+        TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,()->{pulses.incrementAndGet();return "switched";});
+        TransferCoordinator.LogContext context=new TransferCoordinator.LogContext(null,"FILE_SENDER","ui",f->new TransferCoordinator.FrameInfo("session","INVITE",0,21),()->false,true,1000);
         Object owner=new Object();
         coordinator.startSend(owner,"pair","pair INVITE",frame->new TransferCoordinator.Outcome("pair DATA","next",false).retrying("WAIT_ACK_DATA_1"),new TransferCoordinator.Listener(){public void onStatus(String text){}public void onStopped(TransferCoordinator.StopReason reason){}},context);
-        clock.advance(900);scheduler.runAll();check(pulses.get()==0,"no early keys");
-        clock.advance(100);scheduler.runAll();check(pulses.get()==1,"host pulses with logging off and UI dispatcher idle");
-        clock.advance(2000);scheduler.runAll();scheduler.runAll();check(pulses.get()==2,"own frame wait continues keyboard assistance");
-        clock.advance(1000);scheduler.runAll();check(pulses.get()==3,"next interval alternates keyboard without rewrite");
-        clipboard.write("pair READY");scheduler.runAll();clock.advance(1100);scheduler.runAll();check(pulses.get()==4,"new frame can pulse");
-        check(directions.equals(List.of(true,false,true,false)),"single keys alternate across retries and next frames");
-        coordinator.endSession(owner);clock.advance(5000);scheduler.runAll();check(pulses.get()==4,"no keys after end");
+        clock.advance(999);scheduler.runAll();check(pulses.get()==0,"no focus switch before first publication settles");
+        clock.advance(1);scheduler.runAll();check(pulses.get()==1,"host switches after one second with logging off and UI dispatcher idle");
+        clock.advance(2999);scheduler.runAll();check(pulses.get()==1,"switch leaves three seconds for clipboard propagation");
+        clock.advance(1);scheduler.runAll();scheduler.runAll();check(pulses.get()==2,"second switch after observation window");
+        clock.advance(3000);scheduler.runAll();check(pulses.get()==3,"third switch without rewriting data");
+        clock.advance(3000);scheduler.runAll();check(pulses.get()==3,"same frame recovery bounded to three");
+        clipboard.write("pair READY");scheduler.runAll();clock.advance(999);scheduler.runAll();check(pulses.get()==3,"next data starts its own one-second delay");clock.advance(1);scheduler.runAll();check(pulses.get()==4,"new data can switch after one second");
+
+        coordinator.endSession(owner);clock.advance(5000);scheduler.runAll();check(pulses.get()==4,"no focus switching after end");
         coordinator.dispose();scheduler.shutdownNow();
         ManualScheduler vmScheduler=new ManualScheduler();
-        TransferCoordinator vm=new TransferCoordinator(new Clipboard(),r->{},()->clock.now,vmScheduler,left->{throw new AssertionError("VM must not inject keys");});
+        TransferCoordinator vm=new TransferCoordinator(new Clipboard(),r->{},()->clock.now,vmScheduler,()->{throw new AssertionError("VM must not switch focus");});
         vm.startSend(new Object(),"pair","pair INVITE",frame->null,new TransferCoordinator.Listener(){public void onStatus(String text){}public void onStopped(TransferCoordinator.StopReason reason){}},new TransferCoordinator.LogContext(null,"FILE_SENDER","vm",f->null,()->false,false));
         clock.advance(3000);vmScheduler.runAll();vm.dispose();vmScheduler.shutdownNow();
     }
 
-    private static void busyReadStillAllowsInputAssist(){
+    private static void busyReadStillAllowsFocusAssist(){
         Clock clock=new Clock();ManualScheduler scheduler=new ManualScheduler();AtomicInteger calls=new AtomicInteger();
         boolean[] busy={true};AtomicInteger writes=new AtomicInteger();
         TransferCoordinator.ClipboardAccess clipboard=new TransferCoordinator.ClipboardAccess(){
             public String read()throws Exception{if(busy[0])throw new java.io.IOException("clipboard busy");return "";}
             public void write(String value){writes.incrementAndGet();}
         };
-        TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,left->{if(calls.get()<2)check(left,"skipped key keeps left direction");return calls.incrementAndGet()==1?"not_rdp":"sent";});
+        TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,()->{return calls.incrementAndGet()==1?"not_rdp":"switched";});
         Object owner=new Object();
         coordinator.startReceive(owner,"pair",frame->null,listener(new AtomicInteger(),new AtomicInteger()),
-            new TransferCoordinator.LogContext(null,"FILE_RECEIVER","host",f->null,()->false,true));
-        clock.advance(2000);scheduler.runAll();check(calls.get()==1,"busy reads must not starve input assistance");
-        clock.advance(400);scheduler.runAll();check(calls.get()==1,"skipped input checks are throttled");
-        clock.advance(1600);scheduler.runAll();check(calls.get()==2,"focus skip must preserve the key opportunity");
-        clock.advance(3000);scheduler.runAll();check(calls.get()==3&&writes.get()==0,"busy reads permit spaced keys but never blindly publish");
+            new TransferCoordinator.LogContext(null,"FILE_RECEIVER","host",f->null,()->false,true,1000));
+        clock.advance(1000);scheduler.runAll();check(calls.get()==1,"busy reads must not starve first focus recovery");
+        clock.advance(400);scheduler.runAll();check(calls.get()==1,"skipped focus checks are throttled");
+        clock.advance(600);scheduler.runAll();check(calls.get()==2,"focus skip preserves opportunity after one second");
+        clock.advance(2999);scheduler.runAll();check(calls.get()==2,"busy reads preserve observation window after successful switch");
+        clock.advance(1);scheduler.runAll();check(calls.get()==3&&writes.get()==0,"busy reads permit spaced focus recovery but never blindly publish");
         busy[0]=false;scheduler.runAll();check(coordinator.hasActiveTransfer(),"transient busy keeps listening");
         coordinator.endSession(owner);coordinator.dispose();scheduler.shutdownNow();
     }
@@ -498,12 +585,12 @@ public final class TransferCoordinatorTest {
             Clock clock=new Clock();Clipboard clipboard=new Clipboard();ManualScheduler scheduler=new ManualScheduler();
             String peer=pending.contains("DATA")?"pair BLOCK_ACK_11":"pair FINAL";
             AtomicInteger handled=new AtomicInteger();
-            TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,left->{clipboard.write(peer);return "sent";});
+            TransferCoordinator coordinator=new TransferCoordinator(clipboard,r->{},()->clock.now,scheduler,()->{clipboard.write(peer);return "switched";});
             Object owner=new Object();
             coordinator.startSend(owner,"pair",pending,frame->{check(frame.equals(peer),"new peer must be processed");handled.incrementAndGet();return new TransferCoordinator.Outcome(null,"done",true);},
-                listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"TEST","host",f->new TransferCoordinator.FrameInfo("session","CONTROL",0,1),()->false,true));
-            clock.advance(3000);scheduler.runAll();
-            check(clipboard.read().equals(peer),"retry must preserve peer frame arriving during key injection");
+                listener(new AtomicInteger(),new AtomicInteger()),new TransferCoordinator.LogContext(null,"TEST","host",f->new TransferCoordinator.FrameInfo("session","CONTROL",0,1),()->false,true,1000));
+            clock.advance(11000);scheduler.runAll();
+            check(clipboard.read().equals(peer),"retry must preserve peer frame arriving during focus switching");
             scheduler.runAll();check(handled.get()==1,"preserved peer is processed on next poll");
             coordinator.dispose();scheduler.shutdownNow();
         }
@@ -528,10 +615,12 @@ public final class TransferCoordinatorTest {
 
     private record PathPair(java.nio.file.Path sender,java.nio.file.Path receiver){}
     private static final class DelayedBridge {
+        long senderDelay=3000,receiverDelay=5000;
         private final Clock clock;private final List<Delivery> deliveries=new ArrayList<>();private final EndpointClipboard sender=new EndpointClipboard("sender"),receiver=new EndpointClipboard("receiver");
         DelayedBridge(Clock clock){this.clock=clock;sender.bridge=this;receiver.bridge=this;}
         EndpointClipboard sender(){return sender;}EndpointClipboard receiver(){return receiver;}
-        synchronized void publish(EndpointClipboard from,String value){long delay=from.name.equals("sender")?3_000:5_000;deliveries.add(new Delivery(clock.now+delay,from==sender?receiver:sender,value));}
+        java.util.function.Predicate<String> drop=frame->false;
+        synchronized void publish(EndpointClipboard from,String value){if(drop.test(value))return;long delay=from.name.equals("sender")?senderDelay:receiverDelay;deliveries.add(new Delivery(clock.now+delay,from==sender?receiver:sender,value));}
         synchronized void deliver(){deliveries.sort(java.util.Comparator.comparingLong(Delivery::at));while(!deliveries.isEmpty()&&deliveries.get(0).at<=clock.now){Delivery d=deliveries.remove(0);d.to.value=d.value;d.to.revision++;}}
         synchronized int pending(){return deliveries.size();}
         private record Delivery(long at,EndpointClipboard to,String value){}

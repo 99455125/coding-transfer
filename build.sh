@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
+plugin_java_version=21
+if [[ "${1:-build}" == "build-2026.2" ]]; then plugin_java_version=25; fi
 if [[ -n "${PLUGIN_JDK:-}" ]]; then
   plugin_jdk="$PLUGIN_JDK"
 elif [[ -x "/Applications/IntelliJ IDEA.app/Contents/jbr/Contents/Home/bin/javac" ]]; then
   plugin_jdk="/Applications/IntelliJ IDEA.app/Contents/jbr/Contents/Home"
 else
-  plugin_jdk="$(/usr/libexec/java_home -v 21)"
+  plugin_jdk="$(/usr/libexec/java_home -v "$plugin_java_version")"
 fi
 plugin_sdk="${PLUGIN_SDK:-$HOME/Library/Caches/coding-transfer-sdk-2025.1.2}"
 if [[ $# -gt 2 ]]; then
-  echo "Usage: ./build.sh [build | test GROUP]" >&2
+  echo "Usage: ./build.sh [build | build-2026.2 | test GROUP]" >&2
   exit 2
 fi
 build_args=("${1:-build}" "$plugin_sdk")

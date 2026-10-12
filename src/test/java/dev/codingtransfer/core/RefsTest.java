@@ -13,6 +13,7 @@ final class RefsTest {
 
     private static boolean row(List<GitHistory.RefChange> rows,String ref,String path,boolean working){return rows.stream().anyMatch(r->r.ref().equals(ref)&&r.path().equals(path)&&r.working()==working);}
     static void run(Path temp)throws Exception{
+        caseDistinctRefs(temp);
         Path vm=Files.createDirectory(temp.resolve("refs-vm")),host=Files.createDirectory(temp.resolve("refs-host")),local=host.resolve("project");
         TestSupport.initRepository(vm);
         Files.writeString(vm.resolve("a.txt"),"base\n");Files.writeString(vm.resolve("stable.txt"),"stable\n");git(vm,"add","a.txt","stable.txt");git(vm,"commit","-qm","base");String first=git(vm,"rev-parse","HEAD");
@@ -48,5 +49,51 @@ final class RefsTest {
         git(vm,"update-ref","-d","refs/custom/release");Payload removed=sender.generate("repo",true).payload();engine.apply(engine.preview("repo",removed));check(git(local,"for-each-ref","--format=%(refname)","refs/vmsync/refs/custom/release").isEmpty(),"deleted arbitrary ref removed from mirror");
         BitSet copied=new BitSet();copied.set(2);check(copied.nextClearBit(0)+1==1,"middle-first copy keeps first missing 1");copied.set(0);check(copied.nextClearBit(0)+1==2,"copy missing advances to 2");copied.set(1);check(copied.nextClearBit(0)+1==4,"copy missing skips previously copied 3");
         System.out.println("PASS ALL "+checks+" Refs checks");
+    }
+
+    private static void caseDistinctRefs(Path temp)throws Exception{
+        Path vm=Files.createDirectory(temp.resolve("case-refs-vm")),host=Files.createDirectory(temp.resolve("case-refs-host"));
+        TestSupport.initRepository(vm);Files.writeString(vm.resolve("a.txt"),"base\n");
+        git(vm,"add","a.txt");git(vm,"commit","-qm","base");String head=git(vm,"rev-parse","HEAD");
+        // Packed refs can retain case-distinct names even on a case-insensitive filesystem.
+        StringBuilder packed=new StringBuilder();
+        for(String tag:List.of("A","A".repeat(100),"A".repeat(200),"V0.3.12","_41/foo","_X","v0.3.12").stream().sorted().toList())packed.append(head).append(" refs/tags/").append(tag).append('\n');
+        Files.writeString(vm.resolve(".git/packed-refs"),packed);
+        git(vm,"branch","Feature");git(vm,"branch","feature_46");
+        Config vc=new Config(Role.VM,List.of(new Config.Mapping("case","project",vm.toString())),List.of(),4,"git"),hc=new Config(Role.HOST,vc.projects(),vc.exclude(),4,"git");
+        BundleSync sender=new BundleSync(vm,vc),receiver=new BundleSync(host,hc);SyncEngine engine=new SyncEngine(host,hc);
+        Payload full=sender.generate("case",false).payload();
+        check(full.git().refs().containsKey("refs/tags/V0.3.12")&&full.git().refs().containsKey("refs/tags/v0.3.12"),"case-distinct source tags remain in wire manifest");
+        engine.apply(engine.preview("case",full));Path root=host.resolve("project");
+        check(git(root,"rev-parse","refs/tags/vm-sync/_560.3.12").equals(head)&&git(root,"rev-parse","refs/tags/vm-sync/v0.3.12").equals(head),"case-distinct tags both imported without lock collision");
+        check(git(root,"for-each-ref","--format=%(refname)","refs/tags/vm-sync/").lines().count()==7,"long source names with a common prefix import without file/directory collision");
+        check(git(root,"rev-parse","refs/heads/vm-work/_46eature").equals(head)&&git(root,"rev-parse","refs/heads/vm-work/feature_5f46").equals(head),"branch names and literal escape markers remain distinct");
+        sender.acceptReceipt("case",receiver.receipt("case"));
+        // A previously imported single uppercase tag must migrate without sharing the new lowercase lock.
+        git(root,"update-ref","-d","refs/tags/vm-sync/_560.3.12");git(root,"update-ref","-d","refs/tags/vm-sync/v0.3.12");
+        git(root,"update-ref","-d","refs/tags/vm-sync/_41");git(root,"update-ref","-d","refs/tags/vm-sync/_5f41/foo");
+        for(String ref:git(root,"for-each-ref","--format=%(refname)","refs/tags/vm-sync/_x/").lines().toList())git(root,"update-ref","-d",ref);
+        git(root,"update-ref","-d","refs/tags/vm-sync/_5f_58");
+        git(root,"update-ref","refs/tags/vm-sync/V0.3.12",head);
+        git(root,"update-ref","refs/tags/vm-sync/A",head);git(root,"update-ref","refs/tags/vm-sync/_41/foo",head);
+        git(root,"update-ref","refs/tags/vm-sync/_X",head);git(root,"update-ref","refs/tags/vm-sync/"+"A".repeat(100),head);git(root,"update-ref","refs/tags/vm-sync/"+"A".repeat(200),head);
+        git(vm,"checkout","-q","Feature");Payload delta=sender.generate("case",true).payload();
+        String legacyRefs=git(root,"show-ref"),legacyHead=Files.readString(root.resolve(".git/HEAD"));
+        Path blocked=root.resolve(".git/refs/tags/vm-sync/_560.3.12.lock");Files.writeString(blocked,"");
+        try{engine.apply(engine.preview("case",delta));throw new AssertionError("expected migration failure");}catch(IOException expected){check(expected.getMessage().contains("_560.3.12"),"migration reaches the intentionally blocked portable ref");}
+        check(git(root,"show-ref").equals(legacyRefs)&&Files.readString(root.resolve(".git/HEAD")).equals(legacyHead),"failed portable migration restores already removed legacy ref");
+        Files.delete(blocked);engine.apply(engine.preview("case",delta));
+        check(git(root,"symbolic-ref","HEAD").equals("refs/heads/vm-work/_46eature"),"current branch uses the same portable mapping");
+        check(git(root,"rev-parse","refs/tags/vm-sync/_560.3.12").equals(head)&&git(root,"rev-parse","refs/tags/vm-sync/v0.3.12").equals(head),"legacy uppercase mirror migrates while retaining both source tags");
+        check(git(root,"rev-parse","refs/tags/vm-sync/_41").equals(head)&&git(root,"rev-parse","refs/tags/vm-sync/_5f41/foo").equals(head),"legacy parent-child names migrate without ref directory conflict");
+        check(git(root,"for-each-ref","--format=%(refname)","refs/tags/vm-sync/").lines().count()==7,"case-folded legacy parent paths migrate without losing a ref");
+        sender.acceptReceipt("case",receiver.receipt("case"));
+        String beforeRefs=git(root,"show-ref"),beforeHead=Files.readString(root.resolve(".git/HEAD"));
+        Files.writeString(vm.resolve(".git/packed-refs"),head+" refs/tags/v0.3.12\n");
+        Payload removed=sender.generate("case",true).payload();
+        try{engine.apply(engine.preview("case",removed),new SyncEngine.ApplyObserver(){public void afterWrite(int count){}public void afterGitCommit()throws IOException{throw new IOException("rollback case refs");}});throw new AssertionError("expected rollback");}catch(IOException expected){}
+        check(git(root,"show-ref").equals(beforeRefs)&&Files.readString(root.resolve(".git/HEAD")).equals(beforeHead),"case-distinct ref deletion rolls back refs and HEAD");
+        engine.apply(engine.preview("case",removed));
+        check(git(root,"for-each-ref","--format=%(refname)","refs/tags/vm-sync/").equals("refs/tags/vm-sync/v0.3.12"),"delta removes only the deleted case-distinct tag");
     }
 }

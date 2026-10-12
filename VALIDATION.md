@@ -202,3 +202,35 @@ Temporary local Git repositories only; no business repositories edited, no netwo
 6. Commit on VM, return a fresh snapshot, and verify HOST baseline and code advance together.
 7. Test a multi-block transfer with a repeated block and a restarted receiver.
 8. Only after these checks, register real business projects.
+
+
+## 2026-10-12 — 6.0.3 end-session recovery
+
+VM Bundle ending now archives its pending full target and acknowledged-baseline fingerprint before releasing active occupancy. Explicit recovery preserves outgoing payload/chunks, frame/state and receipts; stale baseline or other active sessions reject recovery. Failed recovery remains retryable, and interrupted end/restore repairs run in background before loading the send. Astra read-only review found two recovery-entry issues; both were fixed and re-reviewed without remaining blockers.
+
+Focused `./build.sh test bundle`: PASS, including real pending write failure, partial archive failure/retry, other context/inflight protection, ended ACK rejection, retained source/progress, baseline stale rejection and interrupted-end recovery. Final log: `.build/test-7778830216868596478/bundle.log`. Full regression, live IDEA/RDP focus switching and installation were not run.
+
+Both release packages compiled against IC-251.26094.121/JDK21 and IU-262.10968.63/JDK25; ZIP/JAR integrity, descriptor 6.0.3, excluded test/keyboard classes and adjacent SHA-256 files verified. Old 6.0.2 distribution ZIP/checksum files removed. No commit, push, installation or business-repository Git write.
+
+
+## 2026-10-12 — 6.0.4 faster focus assistance
+
+First HOST focus attempt now waits one second after publication; successful cycles leave three seconds of observation before retry, retaining three-cycle budget, duplicate publication guards, user input/foreground guards and VM disablement. Polling remains 400 ms, focus dwell 150 ms and receiver protocol retry 10 seconds. Focus logs add wait_ms, duration_ms and frame_chars without payload content. This follows the supplied 512 KiB-session logs; other sizes were not benchmarked and no linear size model is claimed.
+
+RED: focused gate failed at first recovery after one second. GREEN: focused gate PASS on JDK21; SDK251 coordinator harness PASS in `.build/coordinator-pull-0dxdztag/test.log`; `./build.sh test transport` PASS in `.build/test-7262959596281746520/transport.log`. Astra read-only review found no blockers. Both release builds and ZIP/JAR descriptors/checksums passed. Full regression, installation and new live RDP speed measurements were not run. Old 6.0.3 distribution ZIP/checksum files removed; no Git writes or automatic installation.
+
+
+## 2026-10-12 — 6.0.5 configurable focus delay and compact settings
+
+Added local clipboard.focus-delay-ms (default 300 ms, validated 50..60000), retained old constructors/YAML compatibility, preserved it on both chunk-setting paths and passed it to per-session focus gates from both panels. Existing 400 ms polling, three-second post-cycle observation, focus/user guards and receiver ten-second retries remain; configured delay is a minimum checked by polling. Settings puts role/Git/chunk/focus on one row; identity has pairing disclosure, exclusions have disclosure; both default collapsed and retain editable values.
+
+Config RED rejected new clipboard field; default gate RED failed at 300 ms. GREEN: core `.build/test-2974779591536722539/core.log`, transport `.build/test-18321129750056292950/transport.log`, coordinator `.build/coordinator-pull-nw_a0795/test.log` PASS; focused gate and FileTransferConfigTest PASS. Configured 300/750 ms tests start timing after a simulated successful write; chunk edit preserves custom focus setting. Headless production SettingsLayout preview inspected at 780x490: collapsed project region 365 px, both disclosures expanded 191 px; collapse preserved pairing input. This is structural preview, not native IDEA UI validation. Astra read-only review found no blockers.
+
+Both release builds against exact IC251/JDK21 and IU262/JDK25 and ZIP/JAR/descriptors/checksums verified. Old 6.0.4 distribution ZIP/checksum files removed. No full regression, live IDEA interaction, 300 ms RDP speed measurement, installation, commit or business Git write.
+
+
+## 2026-10-12 — 6.0.6 settings pairing import
+
+Settings clipboard actions capture the current EDT ModalityState before asynchronous IO and dispatch completion into that state, with disposed-dialog protection. SDK251 bytecode confirms background-thread default invokeLater uses nonmodal state, which is blocked by the modal settings dialog. No claim of native IDEA reproduction. Valid three-line input now supplies IDENTITY on focus loss and save, before Config parsing; invalid text leaves identity unchanged. Credentials are still stored and verified only on save.
+
+RED: new SettingsPairingInputTest did not compile before the production input helper existed. GREEN: input tests PASS on SDK251/JDK21 and SDK262/JDK25; SDK251 PairingSecretServiceTest PASS. The SDK262 KeePass test cannot run headlessly without an Application and failed at provider construction; it is not counted as passing. Coordinator harness PASS on both SDKs (.build/coordinator-pull-bdrw9yck/test.log and .build/coordinator-pull-oxozf_ga/test.log). Astra read-only review found no blockers. Two release packages verified for ZIP/JAR integrity, 6.0.6 version, SDK compatibility, and SHA-256; old 6.0.5 distributions removed. No full regression, native modal-dialog interaction, installation, or business Git writes.

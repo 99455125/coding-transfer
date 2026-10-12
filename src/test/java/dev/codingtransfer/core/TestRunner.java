@@ -29,7 +29,7 @@ public final class TestRunner {
                 switch (group) {
                     case "core" -> CoreTest.run("core", fixture);
                     case "worktree" -> { WorktreeTest.run(fixture); UntrackedTest.run(fixture); }
-                    case "bundle" -> { BundleTest.run(fixture); RefsTest.run(fixture); TransferCompletionIntegrationTest.run(fixture); }
+                    case "bundle" -> { BundleSessionExitTest.run(fixture); BundleTest.run(fixture); RefsTest.run(fixture); TransferCompletionIntegrationTest.run(fixture); }
                     case "transport" -> { EncryptedFrameTest.run(); TransferSessionStoreTest.run(fixture); TransferCompletionStoreTest.run(fixture); TransferSessionLeaseTest.run(); ReliableTransferTest.run(fixture); CoreTest.run("transport", fixture); FileTransferTest.run(fixture); ProjectInboxTest.run(fixture); }
                     case "cache" -> SendCacheTest.run(fixture);
                     case "large" -> FileTransferTest.runLarge(fixture);

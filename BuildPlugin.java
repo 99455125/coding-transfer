@@ -6,13 +6,17 @@ import java.util.jar.*;
 import java.util.zip.*;
 import javax.tools.ToolProvider;
 
-/** Dependency-free compiler/package launcher. Run with JDK 21, never business JDK 8. */
+/** Dependency-free compiler/package launcher. Never use the business project JDK. */
 public final class BuildPlugin {
     public static void main(String[] args) throws Exception {
-        if (Runtime.version().feature() != 21) throw new IllegalStateException("Plugin build requires JDK 21");
-        if (args.length < 2 || args.length > 3) throw new IllegalArgumentException("Usage: java BuildPlugin.java test|build IDEA_SDK [test-group]");
+        if (args.length < 2 || args.length > 3) throw new IllegalArgumentException("Usage: java BuildPlugin.java test|build|build-2026.2 IDEA_SDK [test-group]");
         boolean test = args[0].equals("test");
-        if (!test && !args[0].equals("build")) throw new IllegalArgumentException("Unknown task");
+        boolean idea2026 = args[0].equals("build-2026.2");
+        if (!test && !idea2026 && !args[0].equals("build")) throw new IllegalArgumentException("Unknown task");
+        int javaVersion=idea2026?25:21;
+        if (Runtime.version().feature() != javaVersion) throw new IllegalStateException("Plugin task requires JDK "+javaVersion);
+        String sdkBuild=idea2026?"IU-262.10968.63":"IC-251.26094.121";
+        String compatibilityTarget=idea2026?"262.10968.63–262.*":"251.26094.121–253.*";
         if (test && (args.length != 3 || !Set.of("core","worktree","bundle","transport","cache","large","all").contains(args[2]))) {
             throw new IllegalArgumentException("Specify test group: core|worktree|bundle|transport|cache|large|all");
         }
@@ -21,10 +25,11 @@ public final class BuildPlugin {
         Files.createDirectories(root.resolve(".build"));
         Path output=Files.createTempDirectory(root.resolve(".build"),test?"test-":"release-");
         Path classes=Files.createDirectory(output.resolve("classes"));
-        List<String> options=new ArrayList<>(List.of("--release","21","-encoding","UTF-8","-d",classes.toString()));
+        List<String> options=new ArrayList<>(List.of("--release",Integer.toString(javaVersion),"-encoding","UTF-8","-d",classes.toString()));
         if(!test){
-            if(!Files.readString(sdk.resolve("build.txt")).strip().equals("IC-251.26094.121"))throw new IOException("Release requires IC-251.26094.121 SDK");
-            try(var paths=Files.list(sdk.resolve("lib"))){options.addAll(List.of("-classpath",String.join(File.pathSeparator,paths.filter(p->p.toString().endsWith(".jar")).map(Path::toString).toList())));}
+            Path buildFile=sdk.resolve(idea2026?"Resources/build.txt":"build.txt");
+            if(!Files.readString(buildFile).strip().equals(sdkBuild))throw new IOException("Release requires "+sdkBuild+" SDK");
+            try(var paths=Files.list(sdk.resolve("lib"))){options.addAll(List.of("-classpath",String.join(File.pathSeparator,paths.filter(p->p.toString().endsWith(".jar")).sorted().map(Path::toString).toList())));}
         }
         Path source=root.resolve("src/main/java/dev/codingtransfer"+(test?"/core":""));
         try(var paths=Files.walk(source)){options.addAll(paths.filter(p->p.toString().endsWith(".java")).map(Path::toString).toList());}
@@ -36,17 +41,24 @@ public final class BuildPlugin {
         }
         Path resources=root.resolve("src/main/resources");
         try(var paths=Files.walk(resources)){for(Path file:paths.filter(Files::isRegularFile).toList()){Path target=classes.resolve(resources.relativize(file));Files.createDirectories(target.getParent());Files.copy(file,target);}}
+        if(idea2026){
+            Path descriptor=classes.resolve("META-INF/plugin.xml");
+            String xml=Files.readString(descriptor);
+            String original="<idea-version since-build=\"251.26094.121\" until-build=\"253.*\"/>";
+            if(!xml.contains(original))throw new IOException("Unexpected source plugin compatibility declaration");
+            Files.writeString(descriptor,xml.replace(original,"<idea-version since-build=\"262.10968.63\" until-build=\"262.*\"/>"),StandardCharsets.UTF_8);
+        }
         Path jar=output.resolve("coding-transfer.jar");
         try(JarOutputStream out=new JarOutputStream(Files.newOutputStream(jar));var paths=Files.walk(classes)){
             for(Path file:paths.filter(Files::isRegularFile).sorted().toList()){
                 JarEntry entry=new JarEntry(classes.relativize(file).toString().replace('\\','/'));entry.setTime(0);out.putNextEntry(entry);Files.copy(file,out);out.closeEntry();
             }
         }
-        Path zip=output.resolve("every-sync-5.0.0.zip");
+        Path zip=output.resolve(idea2026?"every-sync-6.0.6-idea2026.2.zip":"every-sync-6.0.6.zip");
         try(ZipOutputStream out=new ZipOutputStream(Files.newOutputStream(zip))){ZipEntry entry=new ZipEntry("coding-transfer/lib/coding-transfer.jar");entry.setTime(0);out.putNextEntry(entry);Files.copy(jar,out);out.closeEntry();}
         Path dist=Files.createDirectories(root.resolve("dist")).resolve(zip.getFileName());Files.copy(zip,dist,StandardCopyOption.REPLACE_EXISTING);
         String sha=HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(dist)));
         Files.writeString(dist.resolveSibling(dist.getFileName()+".sha256"),sha+"  "+dist.getFileName()+"\n",StandardCharsets.UTF_8);
-        System.out.println("Plugin ZIP: "+dist+"\nSHA-256: "+sha+"\nSDK: IC-251.26094.121; target 251.26094.121–253.*");
+        System.out.println("Plugin ZIP: "+dist+"\nSHA-256: "+sha+"\nSDK: "+sdkBuild+"; target "+compatibilityTarget);
     }
 }

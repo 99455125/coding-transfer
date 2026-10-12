@@ -8,11 +8,13 @@ import java.util.regex.Pattern;
 import static dev.codingtransfer.core.Model.*;
 
 /** Intentionally small, fail-closed YAML subset, matching the documented configuration. */
-public record Config(Role role, List<Mapping> projects, List<String> exclude, int chunkKb, String git, String identity) {
+public record Config(Role role, List<Mapping> projects, List<String> exclude, int chunkKb, String git, String identity, int focusDelayMs) {
+    public static final int DEFAULT_FOCUS_DELAY_MS=300,MIN_FOCUS_DELAY_MS=50,MAX_FOCUS_DELAY_MS=60000;
     public record Mapping(String id, String local, String vm) {
         @Override public String toString() { return id; }
     }
-    public Config(Role role,List<Mapping> projects,List<String> exclude,int chunkKb,String git){this(role,projects,exclude,chunkKb,git,"");}
+    public Config(Role role,List<Mapping> projects,List<String> exclude,int chunkKb,String git){this(role,projects,exclude,chunkKb,git,"",DEFAULT_FOCUS_DELAY_MS);}
+    public Config(Role role,List<Mapping> projects,List<String> exclude,int chunkKb,String git,String identity){this(role,projects,exclude,chunkKb,git,identity,DEFAULT_FOCUS_DELAY_MS);}
     public Config { projects = List.copyOf(projects); exclude = List.copyOf(exclude); identity=identity==null?"":identity; }
     public static final String TEMPLATE = """
             # 两端项目 id 和 exclude 保持一致；path 只填写本端路径。
@@ -30,12 +32,13 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
               - "*.log"
             clipboard:
               chunk-size-kb: 128
+              focus-delay-ms: 300
             """;
     public static Config parse(String text) throws IOException {
         require(text.length() <= 64 * 1024, "配置过大");
-        String role = null, git = "git", identity = "", section = ""; int chunk = 128;
+        String role = null, git = "git", identity = "", section = ""; int chunk = 128,focusDelay=DEFAULT_FOCUS_DELAY_MS;
         List<Mapping> mappings = new ArrayList<>(); List<String> exclude = new ArrayList<>();
-        Map<String,String> mapping = null; Set<String> top = new HashSet<>(); boolean chunkSeen = false;
+        Map<String,String> mapping = null; Set<String> top = new HashSet<>(); Set<String> clipboardKeys=new HashSet<>();
         for (String raw : text.split("\\R")) {
             require(!raw.contains("\t"), "YAML 请使用空格缩进");
             String line = raw.strip(); if (line.isEmpty() || line.startsWith("#")) continue;
@@ -74,9 +77,10 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
                     exclude.add(pattern);
                 }
                 case "clipboard" -> {
-                    require(line.startsWith("chunk-size-kb:") && !chunkSeen, "未知或重复 clipboard 项"); chunkSeen = true;
-                    try { chunk = Integer.parseInt(scalar(line.substring("chunk-size-kb:".length()))); }
-                    catch (NumberFormatException e) { throw new IOException("chunk-size-kb 必须是整数"); }
+                    int pos=line.indexOf(':');require(pos>0,"无效 clipboard 项");String key=line.substring(0,pos);require(clipboardKeys.add(key),"重复 clipboard 项: "+key);
+                    require(Set.of("chunk-size-kb","focus-delay-ms").contains(key),"未知 clipboard 项: "+key);
+                    int value;try{value=Integer.parseInt(scalar(line.substring(pos+1)));}catch(NumberFormatException e){throw new IOException(key+" 必须是整数");}
+                    if(key.equals("chunk-size-kb"))chunk=value;else focusDelay=value;
                 }
                 default -> throw new IOException("无效缩进行: " + line);
             }
@@ -86,6 +90,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
         require(identity.isEmpty() || identity.matches("[A-Za-z0-9_-]{1,128}"), "identity 格式无效");
         require(!mappings.isEmpty() && mappings.size() <= 100, "请配置 1–100 个项目");
         require(chunk >= 4 && chunk <= TransferLimits.MAX_CHUNK_KB, "chunk-size-kb 范围为 4–1048576");
+        require(focusDelay>=MIN_FOCUS_DELAY_MS&&focusDelay<=MAX_FOCUS_DELAY_MS,"focus-delay-ms 范围为 50–60000");
         require(!git.isBlank() && !git.contains("\n"), "Git 可执行文件不能为空");
         List<Mapping> active=new ArrayList<>();
         for(Mapping m:mappings){
@@ -103,7 +108,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
         List<String> vmPaths = new ArrayList<>(vms);
         for (String a : vmPaths) for (String b : vmPaths)
             require(a.equals(b) || !a.startsWith(b + "/"), "VM 项目路径不能嵌套");
-        return new Config(Role.valueOf(role), mappings, exclude.stream().distinct().sorted().toList(), chunk, git, identity);
+        return new Config(Role.valueOf(role), mappings, exclude.stream().distinct().sorted().toList(), chunk, git, identity, focusDelay);
     }
     private static String scalar(String s) throws IOException {
         s = s.strip();
@@ -138,7 +143,7 @@ public record Config(Role role, List<Mapping> projects, List<String> exclude, in
         StringBuilder out = new StringBuilder("role: " + role + "\nidentity: '" + identity + "'\ngit: '" + git + "'\nprojects:\n");
         for (Mapping m : projects) out.append("  - id: ").append(m.id()).append("\n    path: '").append(role==Role.HOST?m.local():m.vm()).append("'\n");
         out.append("exclude:\n"); for (String p : exclude) out.append("  - '").append(p).append("'\n");
-        return out.append("clipboard:\n  chunk-size-kb: ").append(chunkKb).append('\n').toString();
+        return out.append("clipboard:\n  chunk-size-kb: ").append(chunkKb).append("\n  focus-delay-ms: ").append(focusDelayMs).append('\n').toString();
     }
     public boolean excluded(String path) {
         for (String component : path.split("/")) if (component.equalsIgnoreCase(".git") || component.equalsIgnoreCase(".vmsync") || component.equalsIgnoreCase(".gitattributes")) return true;

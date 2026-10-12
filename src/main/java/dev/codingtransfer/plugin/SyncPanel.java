@@ -123,7 +123,8 @@ public final class SyncPanel extends JPanel implements Disposable {
         receipt.setVisible(false);acceptReceipt.setVisible(false);paste.setVisible(false);prev.setVisible(false);copy.setVisible(false);next.setVisible(false);
     }
     private void setConfig(Config value){String previous=id();loading=true;config=value;projects.removeAllItems();for(Config.Mapping m:value.projects()){projects.addItem(m);if(m.id().equals(previous))projects.setSelectedItem(m);}loading=false;reset();labels();restoreDurableState();}
-    private void restoreDurableState(){
+    private void restoreDurableState(){restoreDurableState(false);}
+    private void restoreDurableState(boolean repaired){
         if(workspace==null||config==null||busy)return;
         try{TransferCompletionStore records=new TransferCompletionStore(workspace);ReliableTransferEngine.Direction direction=config.role()==Role.VM?ReliableTransferEngine.Direction.HOST_TO_VM:ReliableTransferEngine.Direction.VM_TO_HOST;recoverableFinalAvailable=records.findLatest(ReliableTransferEngine.Kind.PROJECT,id(),direction,TransferCompletionStore.Phase.COMPLETE).filter(r->r.response().length>0).isPresent();if(config.role()==Role.VM&&!recoverableFinalAvailable)recoverableFinalAvailable=records.findLatest(ReliableTransferEngine.Kind.PROJECT,id(),ReliableTransferEngine.Direction.VM_TO_HOST,TransferCompletionStore.Phase.WAIT_FINAL_ACK).isPresent();}catch(IOException e){recoverableFinalAvailable=false;}
         try{var pending=new dev.codingtransfer.core.PendingWorktreeStore(workspace).read();if(config.role()==Role.VM&&pending!=null&&pending.projectId().equals(id())){
@@ -136,7 +137,9 @@ public final class SyncPanel extends JPanel implements Disposable {
         }
         }catch(Exception e){message("待处理 WORKTREE 恢复失败："+e.getMessage());}
         try{
-            TransferSessionStore store=new TransferSessionStore(workspace);if(config.role()==Role.VM){var marker=new dev.codingtransfer.core.PendingBundleTransferStore(workspace).read();if(marker!=null&&marker.projectId().equals(id())&&store.currentContext()==null)store.saveContext(new TransferSessionStore.Context(marker.session(),marker.projectId(),marker.transferId(),ReliableTransferEngine.Kind.PROJECT,ReliableTransferEngine.Direction.VM_TO_HOST,marker.total()));}
+            TransferSessionStore store=new TransferSessionStore(workspace);if(config.role()==Role.VM){
+                if(!repaired&&new BundleSync(workspace,config).needsEndedRestore(id())){String selected=id();Config cfg=config;job("恢复中断的发送状态",()->{new BundleSync(workspace,cfg).repairEndedRestore(selected);return true;},ignored->restoreDurableState(true));return;}
+                var marker=new dev.codingtransfer.core.PendingBundleTransferStore(workspace).read();if(marker!=null&&marker.projectId().equals(id())&&store.currentContext()==null)store.saveContext(new TransferSessionStore.Context(marker.session(),marker.projectId(),marker.transferId(),ReliableTransferEngine.Kind.PROJECT,ReliableTransferEngine.Direction.VM_TO_HOST,marker.total()));}
             var context=store.currentContext();if(context==null||context.kind()!=ReliableTransferEngine.Kind.PROJECT||!context.scopeId().equals(id()))return;
             outerSession=context.session();transferId=context.transferId();transferTotal=context.total();
             boolean localSender=(config.role()==Role.HOST&&context.direction()==ReliableTransferEngine.Direction.HOST_TO_VM)||(config.role()==Role.VM&&context.direction()==ReliableTransferEngine.Direction.VM_TO_HOST);
@@ -147,7 +150,7 @@ public final class SyncPanel extends JPanel implements Disposable {
     }
     private void settings(){try{Config defaults=config==null?Config.parse(Config.TEMPLATE):config;SettingsDialog dialog=new SettingsDialog(project,defaults,size->{
         Config current=config==null?defaults:config;if(size==current.chunkKb())return;
-        Config changed=new Config(current.role(),current.projects(),current.exclude(),size,current.git(),current.identity());
+        Config changed=new Config(current.role(),current.projects(),current.exclude(),size,current.git(),current.identity(),current.focusDelayMs());
         try{SafeFiles.atomicWrite(SafeFiles.state(workspace).resolve("config.yaml"),changed.yaml().getBytes(StandardCharsets.UTF_8));setConfig(changed);}catch(Exception ex){error(ex);}
     },workspace);if(dialog.showAndGet())saveConfig(dialog.result());}catch(Exception e){error(e);}}
     private void saveConfig(Config value){
@@ -170,7 +173,7 @@ public final class SyncPanel extends JPanel implements Disposable {
 
     private byte[] pairingKey() throws IOException {
         if(config.identity().isBlank())throw new IllegalStateException("请先在设置中生成或导入配对配置");
-        byte[] key=new PairingSecretService(workspace).load(config.identity());
+        byte[] key=new PairingSecretService(workspace).loadForSend(config.identity());
         if(key==null)throw new IllegalStateException("当前识别串没有 PasswordSafe 密钥；请点击“设置”并导入配对配置");
         return key;
     }
@@ -181,7 +184,8 @@ public final class SyncPanel extends JPanel implements Disposable {
     private void beginStatusSession(){statusSessionKey=UUID.randomUUID().toString();statusHistory.begin(statusSessionKey);}
     private TransferCoordinator.LogContext logContext(String endpoint){
         byte[] key;try{key=pairingKey();}catch(IOException e){return null;}
-        return new TransferCoordinator.LogContext(workspace,endpoint,statusSessionKey,frame->{ReliableTransferEngine.Message m=ReliableTransferEngine.decode(config.identity(),key,frame);return new TransferCoordinator.FrameInfo(m.session(),m.type().name(),m.index(),m.total());},()->TransferLogSettings.enabled(project,workspace),config.role()==Role.HOST);
+        String identity=config.identity();
+        return new TransferCoordinator.LogContext(workspace,endpoint,statusSessionKey,frame->{ReliableTransferEngine.Message m=ReliableTransferEngine.decode(identity,key,frame);return new TransferCoordinator.FrameInfo(m.session(),m.type().name(),m.index(),m.total());},()->TransferLogSettings.enabled(project,workspace),config.role()==Role.HOST,config.focusDelayMs());
     }
     private TransferCoordinator.Listener transferListener(){
         return new TransferCoordinator.Listener(){
@@ -189,7 +193,7 @@ public final class SyncPanel extends JPanel implements Disposable {
             @Override public void onStatus(TransferCoordinator.StatusEvent value){if(disposed)return;java.time.Instant now=java.time.Instant.now();if(value.complete())statusHistory.complete(value.sessionKey(),value.eventKey(),value.text(),now);else statusHistory.update(value.sessionKey(),value.eventKey(),value.text(),now);status.setText(statusHistory.display());}
             @Override public void onStopped(TransferCoordinator.StopReason reason){
                 if(disposed)return;transferActive=false;pendingConfirmation=(reason==TransferCoordinator.StopReason.RETRY_EXHAUSTED||reason==TransferCoordinator.StopReason.USER_PAUSED)&&outerSession!=null;
-                if(reason==TransferCoordinator.StopReason.USER_ENDED){detachSessionContext();clearTransientSession();contentLayout.show(tabs,"send");updateEnabled();return;}
+                if(reason==TransferCoordinator.StopReason.USER_ENDED){finishEndedSession();return;}
                 if(reason==TransferCoordinator.StopReason.COMPLETED&&sendingAuto){
                     String cache=outgoingPayload==null||outgoingPayload.git()==null?null:outgoingPayload.git().snapshot();
                     String completedSession=outerSession;
@@ -205,9 +209,16 @@ public final class SyncPanel extends JPanel implements Disposable {
     }
     private void endAutomaticTransfer(){
         if(transferActive){coordinator.endSession(this);return;}
-        detachSessionContext();clearTransientSession();contentLayout.show(tabs,"send");message("自动监听已结束；必要恢复数据仍保留在磁盘");updateEnabled();
+        finishEndedSession();
     }
-    private void detachSessionContext(){if(outerSession==null)return;try{new TransferSessionStore(workspace).clearContext(outerSession);}catch(IOException e){message("会话上下文未能解除："+e.getMessage());}}
+    private void finishEndedSession(){
+        String endedSession=outerSession,selected=id();Config cfg=config;boolean vmSender=cfg!=null&&cfg.role()==Role.VM&&sendingAuto;
+        String cache=outgoingPayload==null||outgoingPayload.git()==null?null:outgoingPayload.git().snapshot();
+        pendingConfirmation=endedSession!=null;
+        job("保留恢复数据并结束会话",()->{if(endedSession!=null){if(vmSender)new BundleSync(workspace,cfg).endAutomaticTransfer(selected,endedSession);else new TransferSessionStore(workspace).clearContext(endedSession);}return cache;},protectedCache->{
+            if(protectedCache!=null)sendCaches.remove(protectedCache);clearTransientSession();contentLayout.show(tabs,"send");message("会话已结束，可开始新同步；旧会话可通过恢复待发送继续，已确认基线未改变");updateEnabled();
+        });
+    }
     private void recoverFinalConfirmation(){
         try{byte[] key=pairingKey();if(config.role()==Role.VM){var senderRecord=new TransferCompletionStore(workspace).findLatest(ReliableTransferEngine.Kind.PROJECT,id(),ReliableTransferEngine.Direction.VM_TO_HOST,TransferCompletionStore.Phase.WAIT_FINAL_ACK).orElse(null);if(senderRecord!=null){outerSession=senderRecord.session();transferId=senderRecord.transferId();sendingAuto=true;transferEngine=ReliableTransferEngine.sender(config.identity(),key,new TransferSessionStore(workspace));String finalFrame=new TransferSessionStore(workspace).readFrame(outerSession);ReliableTransferEngine.Message persisted=ReliableTransferEngine.decode(config.identity(),key,finalFrame);if(persisted.type()!=ReliableTransferEngine.Type.FINAL||!persisted.session().equals(outerSession)||!persisted.transferId().equals(transferId))throw new IOException("待恢复 FINAL 与 Bundle 回执不匹配");transferActive=true;pendingConfirmation=false;coordinator.continueConfirmation(this,config.identity(),finalFrame,this::handleSenderFrame,transferListener(),logContext("PROJECT_"+config.role().name()));updateEnabled();return;}}
             ReliableTransferEngine.Direction direction=config.role()==Role.VM?ReliableTransferEngine.Direction.HOST_TO_VM:ReliableTransferEngine.Direction.VM_TO_HOST;var record=new TransferCompletionStore(workspace).findLatest(ReliableTransferEngine.Kind.PROJECT,id(),direction,TransferCompletionStore.Phase.COMPLETE).filter(r->r.response().length>0).orElseThrow(()->new IOException("没有可恢复的最终确认"));
@@ -249,17 +260,20 @@ public final class SyncPanel extends JPanel implements Disposable {
     }
     private void continueAutomaticTransfer(){
         try{
-            if(!pendingConfirmation&&outerSession==null&&hasDetachedBundleTransfer()){restoreDurableState();return;}
+            if(!pendingConfirmation&&outerSession==null&&hasDetachedBundleTransfer()){
+                String selected=id();Config cfg=config;job("恢复已结束的发送",()->{var sync=new BundleSync(workspace,cfg);if(sync.needsEndedRestore(selected))sync.repairEndedRestore(selected);else if(new dev.codingtransfer.core.PendingBundleTransferStore(workspace).read()==null)sync.restoreEndedTransfer(selected);return true;},ignored->restoreDurableState());return;
+            }
             if(!pendingConfirmation||outerSession==null)throw new IllegalStateException("没有待继续的传输");
             byte[] key=pairingKey();String frame=null;
             try{frame=new TransferSessionStore(workspace).readFrame(outerSession);}
             catch(IOException missing){var record=new TransferCompletionStore(workspace).find(outerSession).orElse(null);if(record!=null&&record.response().length>0)frame=new String(record.response(),StandardCharsets.UTF_8);}
+            if(!sendingAuto){String recovered=transferEngine.resumePullReceiver();if(recovered!=null)frame=recovered;}
             transferActive=true;pendingConfirmation=false;updateEnabled();
             TransferCoordinator.FrameHandler handler=sendingAuto?this::handleSenderFrame:this::handleReceiverFrame;
             if(frame==null)coordinator.continueListening(this,config.identity(),handler,transferListener(),logContext("PROJECT_"+config.role().name()));else coordinator.continueConfirmation(this,config.identity(),frame,handler,transferListener(),logContext("PROJECT_"+config.role().name()));
         }catch(Exception e){error(e);updateEnabled();}
     }
-    private boolean hasDetachedBundleTransfer(){if(config==null||config.role()!=Role.VM||workspace==null)return false;try{var marker=new dev.codingtransfer.core.PendingBundleTransferStore(workspace).read();return marker!=null&&marker.projectId().equals(id())&&new TransferSessionStore(workspace).currentContext()==null;}catch(IOException e){return false;}}
+    private boolean hasDetachedBundleTransfer(){if(config==null||config.role()!=Role.VM||workspace==null)return false;try{var marker=new dev.codingtransfer.core.PendingBundleTransferStore(workspace).read();var store=new TransferSessionStore(workspace);var sync=new BundleSync(workspace,config);return outerSession==null&&(sync.needsEndedRestore(id())||(store.currentContext()==null&&((marker!=null&&marker.projectId().equals(id()))||(marker==null&&sync.hasEndedTransfer(id())))));}catch(IOException e){return false;}}
     private String dataFrame(int index)throws IOException{
         byte[] key=pairingKey();String text=outgoing.get(index-1);
         ReliableTransferEngine.Direction direction=config.role()==Role.HOST?ReliableTransferEngine.Direction.HOST_TO_VM:ReliableTransferEngine.Direction.VM_TO_HOST;
@@ -273,11 +287,12 @@ public final class SyncPanel extends JPanel implements Disposable {
         if(!message.session().equals(outerSession)||!message.scopeId().equals(id())||!message.transferId().equals(transferId))throw new TransferCoordinator.UnprocessableFrame("对端消息与当前项目传输不匹配");
         if(java.util.Set.of(ReliableTransferEngine.Type.INVITE,ReliableTransferEngine.Type.DATA,ReliableTransferEngine.Type.FINAL).contains(message.type()))throw new TransferCoordinator.OwnFrame();
         switch(message.type()){
-            case READY->{var result=transferEngine.acceptReadyResult(frame,outerSession);if(result.disposition()==ReliableTransferEngine.ReadyDisposition.DUPLICATE)return new TransferCoordinator.Outcome(result.awaitingDataIndex()<=transferTotal?dataFrame(result.awaitingDataIndex()):null,"继续发送最小未确认块",false).phase("WAIT_ACK_DATA_"+result.awaitingDataIndex());return new TransferCoordinator.Outcome(dataFrame(1),"接收端已准备，发送第 1 / "+transferTotal+" 块",false).retrying("WAIT_ACK_DATA_1");}
-            case BLOCK_ACK->{var result=transferEngine.acceptBlockAckResult(frame);if(result.nextIndex()<=transferTotal)return new TransferCoordinator.Outcome(dataFrame(result.nextIndex()),"已确认 "+result.acknowledgedIndex()+" / "+transferTotal+" 块",false).retrying("WAIT_ACK_DATA_"+result.nextIndex());return new TransferCoordinator.Outcome(null,"全部数据块已确认，等待业务完成确认",false).phase("WAIT_BUSINESS_CONFIRMATION");}
-            case MISSING->{int missing=transferEngine.acceptMissing(frame);return new TransferCoordinator.Outcome(dataFrame(missing),"补传缺失块 "+missing+" / "+transferTotal,false).retrying("WAIT_ACK_DATA_"+missing);}
-            case RECEIVED->{if(config.role()!=Role.HOST)throw new TransferCoordinator.UnprocessableFrame("角色不匹配的接收成功消息");String fin=new ProjectTransferService(workspace,config).acceptWorktreeReceivedAndPrepareFinal(frame,id(),transferId,config.identity(),key);return new TransferCoordinator.Outcome(fin,"VM 已可靠保存 WORKTREE，确认待处理内容接收",false).retrying("WAIT_RECEIVED_ACK");}
-            case BUSINESS_ACK->{if(config.role()!=Role.VM)throw new TransferCoordinator.UnprocessableFrame("角色不匹配的业务应用回执");String fin=new ProjectTransferService(workspace,config).acceptBusinessAckAndPrepareFinal(frame,config.identity(),key);return new TransferCoordinator.Outcome(fin,"HOST 已应用并持久化基线，确认精确待处理包",false).retrying("WAIT_BUSINESS_ACK");}
+            case REQUEST->{int requested=transferEngine.acceptRequest(frame);return new TransferCoordinator.Outcome(dataFrame(requested),"响应接收端请求 · 第 "+requested+" / "+transferTotal+" 块",false).phase("WAIT_ACK_DATA_"+requested);}
+            case READY->{var result=transferEngine.acceptReadyResult(frame,outerSession);if(result.disposition()==ReliableTransferEngine.ReadyDisposition.DUPLICATE)return new TransferCoordinator.Outcome(result.awaitingDataIndex()<=transferTotal?dataFrame(result.awaitingDataIndex()):null,"继续发送最小未确认块",false).phase("WAIT_ACK_DATA_"+result.awaitingDataIndex());return new TransferCoordinator.Outcome(dataFrame(1),"接收端已准备，发送第 1 / "+transferTotal+" 块",false).phase("WAIT_ACK_DATA_1");}
+            case BLOCK_ACK->{var result=transferEngine.acceptBlockAckResult(frame);if(result.nextIndex()<=transferTotal)return new TransferCoordinator.Outcome(dataFrame(result.nextIndex()),"已确认 "+result.acknowledgedIndex()+" / "+transferTotal+" 块",false).phase("WAIT_ACK_DATA_"+result.nextIndex());return new TransferCoordinator.Outcome(null,"全部数据块已确认，等待业务完成确认",false).phase("WAIT_BUSINESS_CONFIRMATION");}
+            case MISSING->{int missing=transferEngine.acceptMissing(frame);return new TransferCoordinator.Outcome(dataFrame(missing),"补传缺失块 "+missing+" / "+transferTotal,false).phase("WAIT_ACK_DATA_"+missing);}
+            case RECEIVED->{if(config.role()!=Role.HOST)throw new TransferCoordinator.UnprocessableFrame("角色不匹配的接收成功消息");String fin=new ProjectTransferService(workspace,config).acceptWorktreeReceivedAndPrepareFinal(frame,id(),transferId,config.identity(),key);return new TransferCoordinator.Outcome(fin,"VM 已可靠保存 WORKTREE，确认待处理内容接收",false).phase("WAIT_FINAL_ACK");}
+            case BUSINESS_ACK->{if(config.role()!=Role.VM)throw new TransferCoordinator.UnprocessableFrame("角色不匹配的业务应用回执");String fin=new ProjectTransferService(workspace,config).acceptBusinessAckAndPrepareFinal(frame,config.identity(),key);return new TransferCoordinator.Outcome(fin,"HOST 已应用并持久化基线，确认精确待处理包",false).phase("WAIT_FINAL_ACK");}
             case FINAL_ACK->{if(config.role()==Role.HOST)new ProjectTransferService(workspace,config).acceptWorktreeFinalAck(frame,id(),transferId,config.identity(),key);else new ProjectTransferService(workspace,config).acceptFinalAck(frame,config.identity(),key);return new TransferCoordinator.Outcome(null,TransferCompletionText.format("双方已确认完成",message.total()),true);}
             default->throw new TransferCoordinator.UnprocessableFrame("当前状态不接受 "+message.type());
         }
@@ -290,21 +305,21 @@ public final class SyncPanel extends JPanel implements Disposable {
             if(config.role()==Role.VM&&incoming!=null)throw new IOException("已有待处理内容，不能替换");
             if(outerSession!=null&&!outerSession.equals(message.session()))throw new TransferCoordinator.UnprocessableFrame("已有其他传输会话正在进行");
             if(outerSession==null){transferEngine=ReliableTransferEngine.receiver(config.identity(),key,new TransferSessionStore(workspace));}
-            var accepted=transferEngine.acceptInviteResult(frame);if(outerSession==null){outerSession=message.session();transferId=message.transferId();transferTotal=message.total();}if(accepted.disposition()==ReliableTransferEngine.InviteDisposition.ALREADY_ADVANCED)return new TransferCoordinator.Outcome(null,"忽略已推进会话的重复邀请",false).phase("WAIT_DATA");return new TransferCoordinator.Outcome(accepted.readyFrame(),"已接收 0 / "+transferTotal+" 块 · 等待数据",false).replayable("WAIT_DATA_1");
+            var accepted=transferEngine.acceptPullInviteResult(frame);if(outerSession==null){outerSession=message.session();transferId=message.transferId();transferTotal=message.total();}if(accepted.disposition()==ReliableTransferEngine.InviteDisposition.ALREADY_ADVANCED)return new TransferCoordinator.Outcome(null,"忽略已推进会话的重复邀请",false).phase("WAIT_DATA");return new TransferCoordinator.Outcome(accepted.readyFrame(),"已请求数据 · 等待接收",false).retrying("WAIT_DATA_"+ReliableTransferEngine.decode(config.identity(),key,accepted.readyFrame()).index());
         }
         if(message.session().equals(outerSession)&&message.type()==ReliableTransferEngine.Type.DATA){
             String replay=new ProjectTransferService(workspace,config).replayCompletedDataResponse(frame,config.identity(),key);
-            if(replay!=null)return new TransferCoordinator.Outcome(replay,"已接收 "+message.total()+" / "+message.total()+" 块 · 重发完成确认",false).retrying("WAIT_BUSINESS_CONFIRMATION");
+            if(replay!=null)return new TransferCoordinator.Outcome(replay,"已接收 "+message.total()+" / "+message.total()+" 块 · 重发完成确认",false).retrying("WAIT_FINAL");
             if(!message.scopeId().equals(id())||!message.transferId().equals(transferId)||message.total()!=transferTotal)throw new IOException("数据块与已接受邀请不匹配");
             ClipboardTransport.Received[] holder=new ClipboardTransport.Received[1];ProjectTransferService service=new ProjectTransferService(workspace,config);
-            String blockAck=transferEngine.acceptData(frame,data->{
+            String blockAck=transferEngine.acceptRequestedData(frame,data->{
                 String chunk=new String(data.payload(),StandardCharsets.UTF_8);ClipboardTransport.Received received=service.receiveChunk(id(),chunk);
                 if(inboundInnerSession==null)inboundInnerSession=received.session();
                 if(!inboundInnerSession.equals(received.session()))throw new IOException("内层分块会话不一致");holder[0]=received;
             });
             ClipboardTransport.Received received=holder[0];
             if(received!=null)ApplicationManager.getApplication().invokeLater(()->{if(disposed)return;receiveCount.setText("会话 "+outerSession.substring(0,8)+" · "+received.received()+" / "+received.total()+" 块 · 最小缺块："+(received.firstMissing()==0?"无":received.firstMissing()));receiveProgress.setMaximum(received.total());receiveProgress.setValue(received.received());});
-            if(received==null||received.payload()==null)return new TransferCoordinator.Outcome(blockAck,"接收中 · 已可靠落盘 "+(received==null?"":received.received()+" / "+received.total()+" 块"),false).replayable("WAIT_DATA_"+(message.index()+1));
+            if(received==null||received.payload()==null)return new TransferCoordinator.Outcome(blockAck,"接收中 · 已可靠落盘 "+(received==null?"":received.received()+" / "+received.total()+" 块"),false).retrying("WAIT_DATA_"+ReliableTransferEngine.decode(config.identity(),key,blockAck).index());
             Payload payload=received.payload();String response;
             if(config.role()==Role.VM){
                 if(!transferId.equals(received.session()))throw new IOException("WORKTREE 内层会话与邀请不匹配");
@@ -319,7 +334,7 @@ public final class SyncPanel extends JPanel implements Disposable {
             try{ClipboardTransport.clear(workspace,received.session());cleanupWarning="";}catch(IOException e){cleanupWarning="；接收缓存清理失败："+e.getMessage();}
             final String cleanup=cleanupWarning;
             incoming=null;ApplicationManager.getApplication().invokeLater(()->{receiveFiles.setText("已应用 · 包内文件 "+fileCount+" 个");message("应用成功，等待 VM 接受精确待处理包回执"+cleanup);updateEnabled();});
-            return new TransferCoordinator.Outcome(response,"已接收 "+received.received()+" / "+received.total()+" 块 · HOST 已应用并持久化基线"+cleanup,false);
+            return new TransferCoordinator.Outcome(response,"已接收 "+received.received()+" / "+received.total()+" 块 · HOST 已应用并持久化基线"+cleanup,false).retrying("WAIT_FINAL");
         }
         if(message.session().equals(outerSession)&&message.type()==ReliableTransferEngine.Type.FINAL){
             String response=config.role()==Role.VM?new ProjectTransferService(workspace,config).acceptWorktreeFinalAndPrepareAck(frame,config.identity(),key)
@@ -329,7 +344,7 @@ public final class SyncPanel extends JPanel implements Disposable {
             recoverableFinalAvailable=true;return new TransferCoordinator.Outcome(response,TransferCompletionText.format("业务已完成",message.total())+"；最终回执由应用级轻量缓存有限重放",true).replayable("WAIT_FINAL_ACK");
         }
         if(message.session().equals(outerSession)&&message.scopeId().equals(id())&&message.transferId().equals(transferId)
-                &&java.util.Set.of(ReliableTransferEngine.Type.READY,ReliableTransferEngine.Type.BLOCK_ACK,ReliableTransferEngine.Type.MISSING,ReliableTransferEngine.Type.RECEIVED,ReliableTransferEngine.Type.BUSINESS_ACK,ReliableTransferEngine.Type.FINAL_ACK).contains(message.type()))throw new TransferCoordinator.OwnFrame();
+                &&java.util.Set.of(ReliableTransferEngine.Type.REQUEST,ReliableTransferEngine.Type.READY,ReliableTransferEngine.Type.BLOCK_ACK,ReliableTransferEngine.Type.MISSING,ReliableTransferEngine.Type.RECEIVED,ReliableTransferEngine.Type.BUSINESS_ACK,ReliableTransferEngine.Type.FINAL_ACK).contains(message.type()))throw new TransferCoordinator.OwnFrame();
         throw new TransferCoordinator.UnprocessableFrame("当前接收状态不接受 "+message.type());
     }
     private void showReceivedWorktree(ClipboardTransport.Received result,Payload payload){
@@ -449,7 +464,7 @@ public final class SyncPanel extends JPanel implements Disposable {
         generate.setEnabled(ready&&!locked&&!pendingVmBundle);incremental.setEnabled(ready&&!locked&&!pendingVmBundle&&!host&&Files.exists(workspace.resolve(".vmsync/bundle-state/acknowledged").resolve(id()+".gz")));
         boolean hasPendingWorktree=false;if(ready&&!host)try{hasPendingWorktree=new dev.codingtransfer.core.PendingWorktreeStore(workspace).read()!=null;}catch(IOException ignored){}
         sendAuto.setEnabled(ready&&!locked&&!outgoing.isEmpty()&&outgoingPayload!=null);receiveAuto.setEnabled(ready&&!locked&&(host||(!pendingVmBundle&&!hasPendingWorktree&&incoming==null&&session==null)));
-        cancelAuto.setVisible(transferActive);cancelAuto.setEnabled(transferActive);boolean detachedSend=hasDetachedBundleTransfer();continueAuto.setText(detachedSend?"恢复待发送":"继续确认");continueAuto.setVisible(pendingConfirmation||detachedSend);continueAuto.setEnabled(ready&&(pendingConfirmation||detachedSend));endAuto.setVisible(transferActive||pendingConfirmation);endAuto.setEnabled(ready&&(transferActive||pendingConfirmation));recoverFinal.setVisible(recoverableFinalAvailable&&!locked);recoverFinal.setEnabled(ready&&recoverableFinalAvailable&&!locked);
+        cancelAuto.setVisible(transferActive);cancelAuto.setEnabled(transferActive);boolean detachedSend=hasDetachedBundleTransfer();continueAuto.setText(detachedSend?"恢复待发送":"继续确认");continueAuto.setVisible(pendingConfirmation||detachedSend);continueAuto.setEnabled(ready&&((!locked&&detachedSend)||pendingConfirmation));endAuto.setVisible(transferActive||pendingConfirmation);endAuto.setEnabled(ready&&(transferActive||pendingConfirmation));recoverFinal.setVisible(recoverableFinalAvailable&&!locked);recoverFinal.setEnabled(ready&&recoverableFinalAvailable&&!locked);
         clearSend.setEnabled(!busy&&!locked&&!pendingVmBundle&&workspace!=null&&(!outgoing.isEmpty()||!sendCaches.isEmpty()||!sendChanges.isEmpty()));
         prev.setEnabled(false);next.setEnabled(false);copy.setEnabled(false);paste.setEnabled(false);receipt.setEnabled(false);acceptReceipt.setEnabled(false);
         apply.setEnabled(ready&&!host&&(incoming!=null||session!=null));clear.setEnabled(ready&&!locked&&session!=null);
